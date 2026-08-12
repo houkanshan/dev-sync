@@ -16,11 +16,31 @@ use watchman_client::{SubscriptionData, fields::NameOnly};
 use crate::project::{Config, Project};
 use crate::sync;
 
+const MAX_LOGGED_PATHS: usize = 20;
+
 fn log(message: impl std::fmt::Display) {
     eprintln!(
         "{} {message}",
         Local::now().to_rfc3339_opts(SecondsFormat::Millis, true)
     );
+}
+
+fn format_changed_paths(paths: &BTreeSet<PathBuf>) -> String {
+    if paths.is_empty() {
+        return "none".into();
+    }
+
+    let mut displayed = paths
+        .iter()
+        .take(MAX_LOGGED_PATHS)
+        .map(|path| format!("{:?}", path.to_string_lossy()))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let omitted = paths.len().saturating_sub(MAX_LOGGED_PATHS);
+    if omitted > 0 {
+        displayed.push_str(&format!(", ... (+{omitted} more)"));
+    }
+    displayed
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -197,9 +217,9 @@ fn worker_loop(
         });
         let full_sync = known.is_empty() || reconcile || barrier || sync::needs_reconcile(&changed);
         let action = if full_sync { "reconcile" } else { "delta" };
-        let path_count = changed.len();
         log(format!(
-            "sync {action} started ({path_count} changed paths)"
+            "sync {action} started; changed paths: {}",
+            format_changed_paths(&changed)
         ));
         let sync_started = Instant::now();
         let result = (|| {
@@ -340,5 +360,30 @@ struct SocketGuard(PathBuf);
 impl Drop for SocketGuard {
     fn drop(&mut self) {
         let _ = std::fs::remove_file(&self.0);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn formats_all_changed_paths_under_limit() {
+        let paths = BTreeSet::from([PathBuf::from("a file.txt"), PathBuf::from("src/main.rs")]);
+        assert_eq!(
+            format_changed_paths(&paths),
+            "\"a file.txt\", \"src/main.rs\""
+        );
+    }
+
+    #[test]
+    fn truncates_changed_paths_at_limit() {
+        let paths = (0..MAX_LOGGED_PATHS + 2)
+            .map(|index| PathBuf::from(format!("{index:02}.txt")))
+            .collect();
+        let formatted = format_changed_paths(&paths);
+        assert!(formatted.contains("\"19.txt\""));
+        assert!(!formatted.contains("\"20.txt\""));
+        assert!(formatted.ends_with("... (+2 more)"));
     }
 }
