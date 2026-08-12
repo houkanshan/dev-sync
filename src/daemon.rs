@@ -5,6 +5,8 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use chrono::{Local, SecondsFormat};
+use devsync::deploy;
+use devsync::transport;
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
@@ -13,8 +15,8 @@ use tokio::sync::{Mutex, mpsc, oneshot};
 use watchman_client::prelude::*;
 use watchman_client::{SubscriptionData, fields::NameOnly};
 
-use crate::project::{Config, Project};
-use crate::sync;
+use crate::project::{Config, Project, load_snapshot, save_snapshot};
+use crate::sync::{self, PlanMode};
 
 const MAX_LOGGED_PATHS: usize = 20;
 
@@ -95,10 +97,10 @@ pub async fn run(root: PathBuf, foreground: bool) -> Result<()> {
     }));
     let (work_tx, work_rx) = mpsc::channel(128);
     let worker = tokio::task::spawn_blocking({
-        let root = project.root.clone();
+        let project = project.clone();
         let config = config.clone();
         let state = Arc::clone(&state);
-        move || worker_loop(root, config, state, work_rx)
+        move || worker_loop(project, config, state, work_rx)
     });
     work_tx
         .send(Work::Changed {
@@ -192,13 +194,14 @@ async fn watch_once(root: &std::path::Path, work_tx: &mpsc::Sender<Work>) -> Res
 }
 
 fn worker_loop(
-    root: PathBuf,
+    project: Project,
     config: Config,
     state: Arc<Mutex<State>>,
     mut work_rx: mpsc::Receiver<Work>,
 ) -> Result<()> {
     let runtime = tokio::runtime::Handle::current();
-    let mut known = BTreeSet::new();
+    let mut acknowledged = load_snapshot(&project.snapshot_path)?;
+    let mut force_full = true;
     while let Some(first) = work_rx.blocking_recv() {
         let mut changed = BTreeSet::new();
         let mut flushes = Vec::new();
@@ -209,53 +212,60 @@ fn worker_loop(
         while let Ok(work) = work_rx.try_recv() {
             collect_work(work, &mut changed, &mut reconcile, &mut flushes, &mut stop);
         }
-        let barrier = !flushes.is_empty() || stop.is_some();
+        if stop.is_some() && changed.is_empty() && !reconcile && flushes.is_empty() {
+            if let Some(stop) = stop {
+                let _ = stop.send(Ok(()));
+            }
+            break;
+        }
+        let mode = if force_full
+            || reconcile
+            || !flushes.is_empty()
+            || sync::needs_reconcile(&project.root, &changed)
+        {
+            PlanMode::Full
+        } else {
+            PlanMode::Delta
+        };
         runtime.block_on(async {
             let mut state = state.lock().await;
             state.syncing = true;
             state.pending = changed.len();
         });
-        let full_sync = known.is_empty() || reconcile || barrier || sync::needs_reconcile(&changed);
-        let action = if full_sync { "reconcile" } else { "delta" };
+        let action = if mode == PlanMode::Full {
+            "validate"
+        } else {
+            "delta"
+        };
         let sync_started = Instant::now();
-        let result = (|| {
-            let current = sync::manifest(&root)?;
-            let delta = (!full_sync).then(|| sync::DeltaPlan::new(&changed, &known, &current));
-            let affected = delta
-                .as_ref()
-                .map(|plan| &plan.affected)
-                .unwrap_or(&current);
-            let did_sync = full_sync || delta.as_ref().is_some_and(|plan| !plan.is_empty());
-            if did_sync {
-                log(format!(
-                    "sync {action} started; paths: {}",
-                    format_changed_paths(affected)
-                ));
-            } else {
-                log(format!(
-                    "sync skipped; no eligible paths in events: {}",
-                    format_changed_paths(&changed)
-                ));
-            }
-            if full_sync {
-                sync::reconcile(&root, &config, &current)?;
-            } else {
-                sync::apply_delta(
-                    &root,
-                    &config,
-                    delta.as_ref().expect("delta plan exists for delta sync"),
-                    &current,
-                )?;
-            }
-            known = current;
-            Ok::<_, anyhow::Error>(did_sync)
-        })();
+        let result =
+            sync_once(&project, &config, &acknowledged, mode, &changed).and_then(|outcome| {
+                let next = sync::committed_snapshot(&acknowledged, &outcome.plan);
+                save_snapshot(&project.snapshot_path, &next)?;
+                Ok((outcome, next))
+            });
         match &result {
-            Ok(true) => log(format!(
-                "sync {action} completed in {}ms",
-                sync_started.elapsed().as_millis()
-            )),
-            Ok(false) => {}
+            Ok((outcome, _)) => {
+                let affected = affected_paths(&outcome.plan.kind);
+                if affected.is_empty() {
+                    log(format!(
+                        "sync {action} completed in {}ms; no managed changes",
+                        sync_started.elapsed().as_millis()
+                    ));
+                } else {
+                    log(format!(
+                        "sync {action} completed in {}ms; paths: {}",
+                        sync_started.elapsed().as_millis(),
+                        format_changed_paths(&affected)
+                    ));
+                }
+                if !outcome.requested.is_empty() {
+                    log(format!(
+                        "uploaded paths: {}",
+                        format_changed_paths(&outcome.requested)
+                    ));
+                }
+            }
             Err(error) => log(format!(
                 "sync {action} failed in {}ms: {error:#}",
                 sync_started.elapsed().as_millis()
@@ -265,14 +275,18 @@ fn worker_loop(
             .as_ref()
             .map(|_| ())
             .map_err(|error| format!("{error:#}"));
-        if result.is_err() {
-            known.clear();
+        match result {
+            Ok((_, next)) => {
+                acknowledged = next;
+                force_full = false;
+            }
+            Err(_) => force_full = true,
         }
         runtime.block_on(async {
             let mut state = state.lock().await;
             state.syncing = false;
             state.pending = 0;
-            if result.is_ok() {
+            if reply.is_ok() {
                 state.last_synced = Some(Instant::now());
                 state.last_error = None;
             } else {
@@ -288,6 +302,35 @@ fn worker_loop(
         }
     }
     Ok(())
+}
+
+fn sync_once(
+    project: &Project,
+    config: &Config,
+    acknowledged: &devsync::snapshot::Snapshot,
+    mode: PlanMode,
+    changed: &BTreeSet<PathBuf>,
+) -> Result<transport::Transaction> {
+    let mut agent = deploy::launch(&config.remote, &config.remote_path)?;
+    let result = transport::transact(
+        &mut agent.stdout,
+        &mut agent.stdin,
+        &project.root,
+        |remote| sync::Planner::new(&project.root, acknowledged).plan(mode, changed, remote),
+    );
+    let wait = agent.wait();
+    match (result, wait) {
+        (Ok(outcome), Ok(())) => Ok(outcome),
+        (Err(error), _) => Err(error),
+        (Ok(_), Err(error)) => Err(error),
+    }
+}
+
+fn affected_paths(kind: &devsync::protocol::PlanKind) -> BTreeSet<PathBuf> {
+    match kind {
+        devsync::protocol::PlanKind::Full { entries } => entries.keys().cloned().collect(),
+        devsync::protocol::PlanKind::Delta { changes } => changes.keys().cloned().collect(),
+    }
 }
 
 fn collect_work(

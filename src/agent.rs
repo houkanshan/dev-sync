@@ -56,7 +56,11 @@ fn serve_session<R: Read, W: Write>(
     };
     let desired = desired_snapshot(&snapshot, &plan)?;
     let candidates = match &plan.kind {
-        PlanKind::Full { entries } => entries.clone(),
+        PlanKind::Full { entries } => entries
+            .iter()
+            .filter(|(_, entry)| entry.needs_payload())
+            .map(|(path, entry)| (path.clone(), entry.clone()))
+            .collect(),
         PlanKind::Delta { changes } => changes
             .iter()
             .filter_map(|(path, entry)| entry.clone().map(|entry| (path.clone(), entry)))
@@ -434,6 +438,29 @@ mod tests {
         assert_eq!(
             needed_payloads(&root, &candidates).unwrap(),
             BTreeSet::from([PathBuf::from("parent/file")])
+        );
+    }
+
+    #[test]
+    fn full_with_matching_remote_content_needs_no_payload() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("root");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("file"), b"matching").unwrap();
+        let candidates = BTreeMap::from([(PathBuf::from("file"), entry(b"matching", false))]);
+        assert!(needed_payloads(&root, &candidates).unwrap().is_empty());
+    }
+
+    #[test]
+    fn full_detects_remote_drift() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("root");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("file"), b"drift").unwrap();
+        let candidates = BTreeMap::from([(PathBuf::from("file"), entry(b"local", false))]);
+        assert_eq!(
+            needed_payloads(&root, &candidates).unwrap(),
+            BTreeSet::from([PathBuf::from("file")])
         );
     }
 

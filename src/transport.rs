@@ -8,46 +8,68 @@ use anyhow::{Context, Result, bail};
 use crate::protocol::{AgentMessage, ClientMessage, PROTOCOL_VERSION, Plan, read_json, write_json};
 use crate::snapshot::{Entry, Generation, validate_relative_path};
 
-/// Runs one plan over a connected agent transport. The reader and writer may be
-/// a local child process or an SSH child process.
-pub fn transact<R: Read, W: Write>(
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RemoteState {
+    pub generation: Generation,
+    pub state_id: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Transaction {
+    pub plan: Plan,
+    pub requested: BTreeSet<std::path::PathBuf>,
+}
+/// Runs one plan over a connected agent transport. The plan is built only after
+/// the remote identity is known, so callers can safely fall back to a full plan.
+pub fn transact<R, W, F>(
     reader: &mut R,
     writer: &mut W,
     local_root: &Path,
-    plan: Plan,
-) -> Result<Generation> {
+    build_plan: F,
+) -> Result<Transaction>
+where
+    R: Read,
+    W: Write,
+    F: FnOnce(&RemoteState) -> Result<Plan>,
+{
     write_json(
         writer,
         &ClientMessage::Hello {
             version: PROTOCOL_VERSION,
         },
     )?;
-    match read_json(reader)? {
+    let remote = match read_json(reader)? {
         Some(AgentMessage::Hello {
             version,
             generation,
             state_id,
-        }) if version == PROTOCOL_VERSION => {
-            if generation == plan.generation && state_id == plan.state_id {
-                // The prior transaction committed but its ACK was lost.
-                return Ok(generation);
-            }
-            if generation != plan.expected_generation || state_id != plan.expected_state_id {
-                bail!(
-                    "remote state changed: expected generation {} state {}, found generation {} state {}",
-                    plan.expected_generation,
-                    plan.expected_state_id,
-                    generation,
-                    state_id
-                );
-            }
-        }
+        }) if version == PROTOCOL_VERSION => RemoteState {
+            generation,
+            state_id,
+        },
         Some(AgentMessage::Hello { version, .. }) => {
             bail!("agent protocol version {version} does not match {PROTOCOL_VERSION}")
         }
         Some(AgentMessage::Error { message }) => bail!("agent handshake failed: {message}"),
         Some(message) => bail!("unexpected agent handshake response: {message:?}"),
         None => bail!("agent closed during handshake"),
+    };
+    let plan = build_plan(&remote)?;
+    if remote.generation == plan.generation && remote.state_id == plan.state_id {
+        // The prior transaction committed but its ACK was lost.
+        return Ok(Transaction {
+            plan,
+            requested: BTreeSet::new(),
+        });
+    }
+    if remote.generation != plan.expected_generation || remote.state_id != plan.expected_state_id {
+        bail!(
+            "plan expected generation {} state {}, handshake found generation {} state {}",
+            plan.expected_generation,
+            plan.expected_state_id,
+            remote.generation,
+            remote.state_id
+        );
     }
 
     write_json(writer, &ClientMessage::Plan(plan.clone()))?;
@@ -100,7 +122,10 @@ pub fn transact<R: Read, W: Write>(
         Some(AgentMessage::Ack {
             generation,
             state_id,
-        }) if generation == plan.generation && state_id == plan.state_id => Ok(generation),
+        }) if generation == plan.generation && state_id == plan.state_id => Ok(Transaction {
+            plan,
+            requested: unique,
+        }),
         Some(AgentMessage::Ack {
             generation,
             state_id,
@@ -201,7 +226,7 @@ mod tests {
         fs::write(temp.path().join("other"), b"data").unwrap();
         let plan = plan("file", b"data");
         let mut reader = responses(&plan, vec![PathBuf::from("other")], 1);
-        assert!(transact(&mut reader, &mut Vec::new(), temp.path(), plan).is_err());
+        assert!(transact(&mut reader, &mut Vec::new(), temp.path(), |_| Ok(plan)).is_err());
     }
 
     #[test]
@@ -210,11 +235,30 @@ mod tests {
         fs::write(temp.path().join("file"), b"changed").unwrap();
         let original_plan = plan("file", b"original");
         let mut reader = responses(&original_plan, vec![PathBuf::from("file")], 1);
-        assert!(transact(&mut reader, &mut Vec::new(), temp.path(), original_plan).is_err());
+        assert!(
+            transact(&mut reader, &mut Vec::new(), temp.path(), |_| {
+                Ok(original_plan)
+            })
+            .is_err()
+        );
 
         let plan = plan("file", b"changed");
         let mut reader = responses(&plan, vec![], 2);
-        assert!(transact(&mut reader, &mut Vec::new(), temp.path(), plan).is_err());
+        assert!(transact(&mut reader, &mut Vec::new(), temp.path(), |_| Ok(plan)).is_err());
+    }
+
+    #[test]
+    fn builds_plan_after_observing_remote_state() {
+        let temp = tempfile::tempdir().unwrap();
+        let plan = plan("file", b"data");
+        let mut reader = responses(&plan, vec![], 1);
+        let result = transact(&mut reader, &mut Vec::new(), temp.path(), |remote| {
+            assert_eq!(remote.generation, 0);
+            assert_eq!(remote.state_id, plan.expected_state_id);
+            Ok(plan.clone())
+        })
+        .unwrap();
+        assert_eq!(result.plan, plan);
     }
 
     #[test]
@@ -235,10 +279,11 @@ mod tests {
                 &mut Cursor::new(bytes),
                 &mut Vec::new(),
                 Path::new("missing"),
-                plan
+                |_| Ok(plan.clone())
             )
-            .unwrap(),
-            1
+            .unwrap()
+            .plan,
+            plan
         );
     }
 }

@@ -6,5 +6,14 @@ cargo fmt --all -- --check
 cargo clippy --all-targets --all-features -- -D warnings
 cargo test --all-targets
 mkdir -p bin
-cargo build
+cargo build --bins
 cp target/debug/devsync bin/devsync
+cp target/debug/devsync-agent bin/devsync-agent
+case "$(uname -s)-$(uname -m)" in
+  Darwin-arm64) tuple=darwin-aarch64 ;;
+  Darwin-x86_64) tuple=darwin-x86_64 ;;
+  Linux-aarch64|Linux-arm64) tuple=linux-aarch64 ;;
+  Linux-x86_64) tuple=linux-x86_64 ;;
+  *) echo "unsupported native agent platform: $(uname -s)-$(uname -m)" >&2; exit 1 ;;
+esac
+cp target/debug/devsync-agent "bin/devsync-agent-$tuple"

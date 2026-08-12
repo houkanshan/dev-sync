@@ -17,6 +17,7 @@ pub struct Project {
     pub config_path: PathBuf,
     pub socket_path: PathBuf,
     pub log_path: PathBuf,
+    pub snapshot_path: PathBuf,
 }
 
 impl Project {
@@ -40,6 +41,7 @@ impl Project {
             root,
             socket_path: runtime.join(format!("{id}.sock")),
             log_path: runtime.join(format!("{id}.log")),
+            snapshot_path: runtime.join(format!("{id}.snapshot.json")),
         }
     }
 
@@ -60,6 +62,32 @@ impl Project {
         }
         Ok(config)
     }
+}
+
+pub fn load_snapshot(path: &Path) -> Result<devsync::snapshot::Snapshot> {
+    match std::fs::read(path) {
+        Ok(bytes) => Ok(serde_json::from_slice(&bytes).context("parse local snapshot")?),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            Ok(devsync::snapshot::Snapshot::default())
+        }
+        Err(error) => Err(error.into()),
+    }
+}
+
+pub fn save_snapshot(path: &Path, snapshot: &devsync::snapshot::Snapshot) -> Result<()> {
+    let parent = path.parent().context("snapshot path has no parent")?;
+    std::fs::create_dir_all(parent)?;
+    let temporary = parent.join(format!(
+        ".{}.new",
+        path.file_name()
+            .context("snapshot path has no file name")?
+            .to_string_lossy()
+    ));
+    let file = std::fs::File::create(&temporary)?;
+    serde_json::to_writer(&file, snapshot)?;
+    file.sync_all()?;
+    std::fs::rename(temporary, path)?;
+    Ok(())
 }
 
 fn stable_id(path: &Path) -> String {

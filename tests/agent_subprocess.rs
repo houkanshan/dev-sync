@@ -48,7 +48,13 @@ fn local_agent_subprocess_requests_and_applies_whole_file() {
         .unwrap();
     let mut stdin = child.stdin.take().unwrap();
     let mut stdout = child.stdout.take().unwrap();
-    assert_eq!(transact(&mut stdout, &mut stdin, &local, plan).unwrap(), 1);
+    assert_eq!(
+        transact(&mut stdout, &mut stdin, &local, |_| Ok(plan.clone()))
+            .unwrap()
+            .plan
+            .generation,
+        1
+    );
     drop(stdin);
     let output = child.wait_with_output().unwrap();
     assert!(
