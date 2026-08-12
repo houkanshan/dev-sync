@@ -4,6 +4,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
+use chrono::{SecondsFormat, Utc};
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
@@ -13,6 +14,13 @@ use watchman_client::{SubscriptionData, fields::NameOnly};
 
 use crate::project::{Config, Project};
 use crate::sync;
+
+fn log(message: impl std::fmt::Display) {
+    eprintln!(
+        "{} {message}",
+        Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true)
+    );
+}
 
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(rename_all = "lowercase")]
@@ -56,6 +64,7 @@ pub async fn run(root: PathBuf) -> Result<()> {
     let listener = UnixListener::bind(&project.socket_path)
         .with_context(|| format!("bind {}", project.socket_path.display()))?;
     let _socket_guard = SocketGuard(project.socket_path.clone());
+    log(format!("daemon started for {}", project.root.display()));
     let state = Arc::new(Mutex::new(State {
         started: Instant::now(),
         syncing: false,
@@ -80,12 +89,26 @@ pub async fn run(root: PathBuf) -> Result<()> {
     let watcher = tokio::spawn(watch(project.root.clone(), work_tx.clone()));
     let mut stopping = false;
     while !stopping {
-        let (stream, _) = listener.accept().await?;
-        stopping = handle_connection(stream, Arc::clone(&state), &work_tx).await?;
+        tokio::select! {
+            accepted = listener.accept() => {
+                let (stream, _) = accepted?;
+                stopping = handle_connection(stream, Arc::clone(&state), &work_tx).await?;
+            }
+            signal = tokio::signal::ctrl_c() => {
+                signal.context("listen for Ctrl-C")?;
+                log("received Ctrl-C; stopping after current sync");
+                let response = wait_for(&work_tx, true).await;
+                if let Response::Error { message } = response {
+                    log(format!("stop failed: {message}"));
+                }
+                stopping = true;
+            }
+        }
     }
     watcher.abort();
     drop(work_tx);
     worker.await??;
+    log("daemon stopped");
     Ok(())
 }
 
@@ -94,7 +117,7 @@ async fn watch(root: PathBuf, work_tx: mpsc::Sender<Work>) -> Result<()> {
         match watch_once(&root, &work_tx).await {
             Ok(()) => {}
             Err(error) => {
-                eprintln!("watchman disconnected: {error:#}; reconnecting");
+                log(format!("watchman disconnected: {error:#}; reconnecting"));
                 tokio::time::sleep(Duration::from_secs(1)).await;
             }
         }
@@ -151,9 +174,16 @@ fn worker_loop(
             state.syncing = true;
             state.pending = changed.len();
         });
+        let full_sync = known.is_empty() || reconcile || barrier || sync::needs_reconcile(&changed);
+        let action = if full_sync { "reconcile" } else { "delta" };
+        let path_count = changed.len();
+        log(format!(
+            "sync {action} started ({path_count} changed paths)"
+        ));
+        let sync_started = Instant::now();
         let result = (|| {
             let current = sync::manifest(&root)?;
-            if known.is_empty() || reconcile || barrier || sync::needs_reconcile(&changed) {
+            if full_sync {
                 sync::reconcile(&root, &config, &current)?;
             } else {
                 sync::apply_delta(&root, &config, &changed, &known, &current)?;
@@ -161,6 +191,16 @@ fn worker_loop(
             known = current;
             Ok::<_, anyhow::Error>(())
         })();
+        match &result {
+            Ok(()) => log(format!(
+                "sync {action} completed in {}ms",
+                sync_started.elapsed().as_millis()
+            )),
+            Err(error) => log(format!(
+                "sync {action} failed in {}ms: {error:#}",
+                sync_started.elapsed().as_millis()
+            )),
+        }
         let reply = result
             .as_ref()
             .map(|_| ())

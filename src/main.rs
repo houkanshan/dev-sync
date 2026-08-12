@@ -21,7 +21,11 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    Start,
+    Start {
+        /// Run in the foreground and write logs to this terminal
+        #[arg(long)]
+        foreground: bool,
+    },
     Status,
     Stop,
     Flush,
@@ -47,7 +51,7 @@ async fn run() -> Result<()> {
 
     let project = Project::discover()?;
     match cli.command {
-        Command::Start => start(&project).await,
+        Command::Start { foreground } => start(&project, foreground).await,
         Command::Status => request(&project, Request::Status).await.map(print_response),
         Command::Flush => request(&project, Request::Flush).await.map(print_response),
         Command::Stop => request(&project, Request::Stop).await.map(print_response),
@@ -55,13 +59,16 @@ async fn run() -> Result<()> {
     }
 }
 
-async fn start(project: &Project) -> Result<()> {
+async fn start(project: &Project, foreground: bool) -> Result<()> {
     if let Ok(response) = request(project, Request::Status).await {
         print_response(response);
         return Ok(());
     }
 
     project.load_config()?;
+    if foreground {
+        return daemon::run(project.root.clone()).await;
+    }
     std::fs::create_dir_all(
         project
             .log_path

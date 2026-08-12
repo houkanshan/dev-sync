@@ -17,6 +17,7 @@ Optional `.dev-syncignore` rules use Git ignore syntax and add exclusions on top
 
 ```console
 dev-sync start
+dev-sync start --foreground  # stay attached and stream timestamped sync logs
 dev-sync status
 dev-sync flush
 dev-sync stop
