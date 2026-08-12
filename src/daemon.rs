@@ -244,18 +244,20 @@ fn worker_loop(
             });
         match &result {
             Ok((outcome, _)) => {
-                let affected = affected_paths(&outcome.plan.kind);
-                if affected.is_empty() {
-                    log(format!(
-                        "sync {action} completed in {}ms; no managed changes",
-                        sync_started.elapsed().as_millis()
-                    ));
-                } else {
-                    log(format!(
-                        "sync {action} completed in {}ms; paths: {}",
-                        sync_started.elapsed().as_millis(),
-                        format_changed_paths(&affected)
-                    ));
+                let elapsed = sync_started.elapsed().as_millis();
+                match &outcome.plan.kind {
+                    devsync::protocol::PlanKind::Full { entries } => log(format!(
+                        "sync validate completed in {elapsed}ms; checked {} managed paths; uploaded {} files",
+                        entries.len(),
+                        outcome.requested.len()
+                    )),
+                    devsync::protocol::PlanKind::Delta { changes } if changes.is_empty() => log(
+                        format!("sync delta completed in {elapsed}ms; no managed changes"),
+                    ),
+                    devsync::protocol::PlanKind::Delta { changes } => log(format!(
+                        "sync delta completed in {elapsed}ms; changed paths: {}",
+                        format_changed_paths(&changes.keys().cloned().collect())
+                    )),
                 }
                 if !outcome.requested.is_empty() {
                     log(format!(
@@ -321,13 +323,6 @@ fn sync_once(
         (Ok(outcome), Ok(())) => Ok(outcome),
         (Err(error), _) => Err(error),
         (Ok(_), Err(error)) => Err(error),
-    }
-}
-
-fn affected_paths(kind: &devsync::protocol::PlanKind) -> BTreeSet<PathBuf> {
-    match kind {
-        devsync::protocol::PlanKind::Full { entries } => entries.keys().cloned().collect(),
-        devsync::protocol::PlanKind::Delta { changes } => changes.keys().cloned().collect(),
     }
 }
 
