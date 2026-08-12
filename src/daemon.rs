@@ -217,26 +217,40 @@ fn worker_loop(
         });
         let full_sync = known.is_empty() || reconcile || barrier || sync::needs_reconcile(&changed);
         let action = if full_sync { "reconcile" } else { "delta" };
-        log(format!(
-            "sync {action} started; changed paths: {}",
-            format_changed_paths(&changed)
-        ));
         let sync_started = Instant::now();
         let result = (|| {
             let current = sync::manifest(&root)?;
+            let affected = if full_sync {
+                current.clone()
+            } else {
+                sync::delta_paths(&changed, &known, &current)
+            };
+            let did_sync = full_sync || !affected.is_empty();
+            if did_sync {
+                log(format!(
+                    "sync {action} started; paths: {}",
+                    format_changed_paths(&affected)
+                ));
+            } else {
+                log(format!(
+                    "sync skipped; no eligible paths in events: {}",
+                    format_changed_paths(&changed)
+                ));
+            }
             if full_sync {
                 sync::reconcile(&root, &config, &current)?;
             } else {
                 sync::apply_delta(&root, &config, &changed, &known, &current)?;
             }
             known = current;
-            Ok::<_, anyhow::Error>(())
+            Ok::<_, anyhow::Error>(did_sync)
         })();
         match &result {
-            Ok(()) => log(format!(
+            Ok(true) => log(format!(
                 "sync {action} completed in {}ms",
                 sync_started.elapsed().as_millis()
             )),
+            Ok(false) => {}
             Err(error) => log(format!(
                 "sync {action} failed in {}ms: {error:#}",
                 sync_started.elapsed().as_millis()

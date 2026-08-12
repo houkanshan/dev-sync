@@ -91,6 +91,18 @@ pub fn reconcile(root: &Path, config: &Config, files: &BTreeSet<PathBuf>) -> Res
     Ok(files.len())
 }
 
+pub fn delta_paths(
+    changed: &BTreeSet<PathBuf>,
+    previous: &BTreeSet<PathBuf>,
+    current: &BTreeSet<PathBuf>,
+) -> BTreeSet<PathBuf> {
+    changed
+        .iter()
+        .filter(|path| current.contains(*path) || previous.contains(*path))
+        .cloned()
+        .collect()
+}
+
 pub fn apply_delta(
     root: &Path,
     config: &Config,
@@ -98,14 +110,12 @@ pub fn apply_delta(
     previous: &BTreeSet<PathBuf>,
     current: &BTreeSet<PathBuf>,
 ) -> Result<usize> {
-    let uploads: BTreeSet<_> = changed.intersection(current).cloned().collect();
-    let deleted = changed
-        .intersection(previous)
-        .any(|path| !current.contains(path));
-    if uploads.is_empty() && !deleted {
+    let affected = delta_paths(changed, previous, current);
+    let uploads: BTreeSet<_> = affected.intersection(current).cloned().collect();
+    if affected.is_empty() {
         return Ok(0);
     }
-    let count = uploads.len() + usize::from(deleted);
+    let count = affected.len();
     transfer(root, config, uploads.iter(), current)?;
     Ok(count)
 }
@@ -276,6 +286,22 @@ mod tests {
         let command = format!("sh -c {}", shell_quote(&script));
         assert!(command.starts_with("sh -c 'set -eu"));
         assert!(command.contains("root='\\''/tmp/a b'\\''\\'\\'''\\''c'\\''"));
+    }
+
+    #[test]
+    fn delta_paths_exclude_ineligible_watchman_events() {
+        let changed = BTreeSet::from([
+            PathBuf::from(".git"),
+            PathBuf::from(".git/index.lock"),
+            PathBuf::from("src/main.rs"),
+            PathBuf::from("deleted.rs"),
+        ]);
+        let previous = BTreeSet::from([PathBuf::from("src/main.rs"), PathBuf::from("deleted.rs")]);
+        let current = BTreeSet::from([PathBuf::from("src/main.rs")]);
+        assert_eq!(
+            delta_paths(&changed, &previous, &current),
+            BTreeSet::from([PathBuf::from("deleted.rs"), PathBuf::from("src/main.rs")])
+        );
     }
 
     #[test]
