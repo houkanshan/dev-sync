@@ -8,6 +8,7 @@ use chrono::{SecondsFormat, Utc};
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
+use tokio::signal::unix::{Signal, SignalKind, signal};
 use tokio::sync::{Mutex, mpsc, oneshot};
 use watchman_client::prelude::*;
 use watchman_client::{SubscriptionData, fields::NameOnly};
@@ -54,7 +55,7 @@ enum Work {
     Stop(oneshot::Sender<Result<(), String>>),
 }
 
-pub async fn run(root: PathBuf) -> Result<()> {
+pub async fn run(root: PathBuf, foreground: bool) -> Result<()> {
     let project = Project::from_root(root.canonicalize()?);
     std::fs::create_dir_all(project.socket_path.parent().expect("socket has parent"))?;
     if project.socket_path.exists() {
@@ -87,19 +88,31 @@ pub async fn run(root: PathBuf) -> Result<()> {
         .await?;
 
     let watcher = tokio::spawn(watch(project.root.clone(), work_tx.clone()));
+    let mut interrupt = if foreground {
+        Some(signal(SignalKind::interrupt()).context("listen for Ctrl-C")?)
+    } else {
+        None
+    };
     let mut stopping = false;
     while !stopping {
+        let connection = async {
+            let (stream, _) = listener.accept().await?;
+            handle_connection(stream, Arc::clone(&state), &work_tx).await
+        };
         tokio::select! {
-            accepted = listener.accept() => {
-                let (stream, _) = accepted?;
-                stopping = handle_connection(stream, Arc::clone(&state), &work_tx).await?;
-            }
-            signal = tokio::signal::ctrl_c() => {
-                signal.context("listen for Ctrl-C")?;
-                log("received Ctrl-C; stopping after current sync");
-                let response = wait_for(&work_tx, true).await;
-                if let Response::Error { message } = response {
-                    log(format!("stop failed: {message}"));
+            result = connection => stopping = result?,
+            _ = receive_interrupt(&mut interrupt), if foreground => {
+                log("received Ctrl-C; stopping after current sync (press Ctrl-C again to force)");
+                tokio::select! {
+                    response = wait_for(&work_tx, true) => {
+                        if let Response::Error { message } = response {
+                            log(format!("stop failed: {message}"));
+                        }
+                    }
+                    _ = receive_interrupt(&mut interrupt) => {
+                        log("received second Ctrl-C; forcing exit");
+                        std::process::exit(130);
+                    }
                 }
                 stopping = true;
             }
@@ -110,6 +123,14 @@ pub async fn run(root: PathBuf) -> Result<()> {
     worker.await??;
     log("daemon stopped");
     Ok(())
+}
+
+async fn receive_interrupt(interrupt: &mut Option<Signal>) {
+    interrupt
+        .as_mut()
+        .expect("interrupt branch is enabled only in foreground mode")
+        .recv()
+        .await;
 }
 
 async fn watch(root: PathBuf, work_tx: mpsc::Sender<Work>) -> Result<()> {

@@ -46,7 +46,7 @@ async fn main() {
 async fn run() -> Result<()> {
     let cli = Cli::parse();
     if let Command::Daemon { root } = cli.command {
-        return daemon::run(std::path::PathBuf::from(root)).await;
+        return daemon::run(std::path::PathBuf::from(root), false).await;
     }
 
     let project = Project::discover()?;
@@ -67,7 +67,7 @@ async fn start(project: &Project, foreground: bool) -> Result<()> {
 
     project.load_config()?;
     if foreground {
-        return daemon::run(project.root.clone()).await;
+        return daemon::run(project.root.clone(), true).await;
     }
     std::fs::create_dir_all(
         project
@@ -128,5 +128,16 @@ fn print_response(response: Response) {
             eprintln!("error: {message}");
             std::process::exit(1);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_foreground_start() {
+        let cli = Cli::try_parse_from(["dev-sync", "start", "--foreground"]).unwrap();
+        assert!(matches!(cli.command, Command::Start { foreground: true }));
     }
 }
