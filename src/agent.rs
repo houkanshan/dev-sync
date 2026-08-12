@@ -37,6 +37,7 @@ fn serve_session<R: Read, W: Write>(
 ) -> Result<()> {
     fs::create_dir_all(root).with_context(|| format!("create target root {}", root.display()))?;
     let snapshot = load_snapshot(state_path)?;
+    let snapshot_state_id = state_id(&snapshot.entries)?;
     let Some(ClientMessage::Hello { version }) = read_json(input)? else {
         bail!("expected hello as first protocol message");
     };
@@ -48,7 +49,7 @@ fn serve_session<R: Read, W: Write>(
         &AgentMessage::Hello {
             version: PROTOCOL_VERSION,
             generation: snapshot.generation,
-            state_id: state_id(&snapshot.entries)?,
+            state_id: snapshot_state_id.clone(),
         },
     )?;
     let Some(message) = read_json(input)? else {
@@ -60,7 +61,7 @@ fn serve_session<R: Read, W: Write>(
         }
         bail!("expected plan or completion after hello");
     };
-    let desired = desired_snapshot(&snapshot, &plan)?;
+    let (desired, desired_state_id) = desired_snapshot(&snapshot, &snapshot_state_id, &plan)?;
     let candidates = match &plan.kind {
         PlanKind::Full { entries } => entries
             .iter()
@@ -109,20 +110,23 @@ fn serve_session<R: Read, W: Write>(
 
     // Application is intentionally per-path. If it is interrupted, the persisted
     // generation is unchanged and the next client must recover with full reconciliation.
-    apply(root, stage.path(), &snapshot, &desired)?;
+    apply(root, stage.path(), &snapshot, &desired, &plan.kind)?;
     save_snapshot(state_path, &desired)?;
     write_json(
         output,
         &AgentMessage::Ack {
             generation: desired.generation,
-            state_id: state_id(&desired.entries)?,
+            state_id: desired_state_id,
         },
     )?;
     Ok(())
 }
 
-fn desired_snapshot(previous: &Snapshot, plan: &Plan) -> Result<Snapshot> {
-    let previous_state_id = state_id(&previous.entries)?;
+fn desired_snapshot(
+    previous: &Snapshot,
+    previous_state_id: &str,
+    plan: &Plan,
+) -> Result<(Snapshot, String)> {
     if plan.expected_generation != previous.generation
         || plan.expected_state_id != previous_state_id
     {
@@ -166,10 +170,13 @@ fn desired_snapshot(previous: &Snapshot, plan: &Plan) -> Result<Snapshot> {
             desired_state_id
         );
     }
-    Ok(Snapshot {
-        generation: plan.generation,
-        entries: std::mem::take(&mut entries),
-    })
+    Ok((
+        Snapshot {
+            generation: plan.generation,
+            entries: std::mem::take(&mut entries),
+        },
+        desired_state_id,
+    ))
 }
 
 fn needed_payloads(
@@ -250,20 +257,51 @@ fn receive_payload<R: Read>(
     Ok(())
 }
 
-fn apply(root: &Path, stage: &Path, previous: &Snapshot, desired: &Snapshot) -> Result<()> {
-    let mut removals: Vec<_> = previous
-        .entries
-        .keys()
-        .filter(|path| !desired.entries.contains_key(*path))
-        .cloned()
-        .collect();
+fn apply(
+    root: &Path,
+    stage: &Path,
+    previous: &Snapshot,
+    desired: &Snapshot,
+    kind: &PlanKind,
+) -> Result<()> {
+    match kind {
+        PlanKind::Full { .. } => {
+            let removals = previous
+                .entries
+                .keys()
+                .filter(|path| !desired.entries.contains_key(*path));
+            apply_removals(root, removals)?;
+            apply_entries(root, stage, desired.entries.iter())
+        }
+        PlanKind::Delta { changes } => {
+            let removals = changes
+                .iter()
+                .filter_map(|(path, entry)| entry.is_none().then_some(path));
+            apply_removals(root, removals)?;
+            let entries = changes
+                .iter()
+                .filter_map(|(path, entry)| entry.as_ref().map(|entry| (path, entry)));
+            apply_entries(root, stage, entries)
+        }
+    }
+}
+
+fn apply_removals<'a>(root: &Path, paths: impl IntoIterator<Item = &'a PathBuf>) -> Result<()> {
+    let mut removals: Vec<_> = paths.into_iter().cloned().collect();
     removals.sort_by_key(|path| std::cmp::Reverse(path.components().count()));
     for path in removals {
         ensure_safe_parent(root, &path)?;
         remove_any(&root.join(path))?;
     }
+    Ok(())
+}
 
-    for (path, entry) in &desired.entries {
+fn apply_entries<'a>(
+    root: &Path,
+    stage: &Path,
+    entries: impl IntoIterator<Item = (&'a PathBuf, &'a Entry)>,
+) -> Result<()> {
+    for (path, entry) in entries {
         let destination = root.join(path);
         ensure_safe_parent(root, path)?;
         match entry {
@@ -431,6 +469,53 @@ mod tests {
     }
 
     #[test]
+    fn delta_apply_touches_only_changed_paths() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("root");
+        let stage = temp.path().join("stage");
+        fs::create_dir_all(&root).unwrap();
+        fs::create_dir_all(&stage).unwrap();
+        fs::write(root.join("changed"), b"same").unwrap();
+        symlink("missing-target", root.join("untouched")).unwrap();
+
+        let unchanged_entry = entry(b"expected-but-drifted", false);
+        let changed_entry = entry(b"same", true);
+        let previous = Snapshot {
+            generation: 1,
+            entries: BTreeMap::from([
+                (PathBuf::from("changed"), entry(b"same", false)),
+                (PathBuf::from("untouched"), unchanged_entry.clone()),
+            ]),
+        };
+        let desired = Snapshot {
+            generation: 2,
+            entries: BTreeMap::from([
+                (PathBuf::from("changed"), changed_entry.clone()),
+                (PathBuf::from("untouched"), unchanged_entry),
+            ]),
+        };
+        let kind = PlanKind::Delta {
+            changes: BTreeMap::from([(PathBuf::from("changed"), Some(changed_entry))]),
+        };
+
+        apply(&root, &stage, &previous, &desired, &kind).unwrap();
+
+        assert_ne!(
+            fs::metadata(root.join("changed"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o111,
+            0
+        );
+        assert_eq!(
+            fs::read_link(root.join("untouched")).unwrap(),
+            Path::new("missing-target")
+        );
+        assert!(desired.entries.contains_key(Path::new("untouched")));
+    }
+
+    #[test]
     fn requests_payload_without_following_symlink_parent() {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().join("root");
@@ -493,7 +578,9 @@ mod tests {
             state_id: "invalid".into(),
             kind: PlanKind::Full { entries },
         };
-        assert!(desired_snapshot(&Snapshot::default(), &plan).is_err());
+        let previous = Snapshot::default();
+        let previous_state_id = state_id(&previous.entries).unwrap();
+        assert!(desired_snapshot(&previous, &previous_state_id, &plan).is_err());
     }
 
     #[test]

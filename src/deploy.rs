@@ -5,7 +5,14 @@ use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 
 use anyhow::{Context, Result, bail};
 
-const SSH_OPTIONS: [&str; 4] = ["-o", "ControlMaster=auto", "-o", "ControlPersist=10m"];
+const SSH_OPTIONS: [&str; 6] = [
+    "-o",
+    "ControlMaster=auto",
+    "-o",
+    "ControlPersist=10m",
+    "-o",
+    "ControlPath=~/.ssh/devsync-%C",
+];
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Platform {
@@ -344,7 +351,7 @@ mod tests {
                 };
                 fs::write(temp.path().join("devsync-agent-linux-x86_64"), &artifact).unwrap();
                 let script = format!(
-                    "#!/bin/sh\nset -eu\nfor command; do :; done\nprintf '%s\\n' \"$command\" >> {}\ncase \"$command\" in\n  *'uname -s; uname -m'*) printf 'Linux\\nx86_64\\n' ;;\n  *'test -f'*) [ -f {} ] ;;\n  *'cat >\"$tmp\"'*) wc -c | tr -d ' ' > {}; touch {} ;;\n  *'exec \"$cache\"'*) cat >/dev/null ;;\n  *) exit 9 ;;\nesac\n",
+                    "#!/bin/sh\nset -eu\nfor command; do :; done\nprintf '%s\n' \"$*\" >> {}\ncase \"$command\" in\n  *'uname -s; uname -m'*) printf 'Linux\\nx86_64\\n' ;;\n  *'test -f'*) [ -f {} ] ;;\n  *'cat >\"$tmp\"'*) wc -c | tr -d ' ' > {}; touch {} ;;\n  *'exec \"$cache\"'*) cat >/dev/null ;;\n  *) exit 9 ;;\nesac\n",
                     shell_quote(log.to_str().unwrap()),
                     shell_quote(marker.to_str().unwrap()),
                     shell_quote(upload.to_str().unwrap()),
@@ -380,12 +387,13 @@ mod tests {
                 fs::read_to_string(&self.log).unwrap()
             }
 
-            fn assert_all_calls_use_posix_shell(&self) {
+            fn assert_all_calls_use_required_ssh_options_and_posix_shell(&self) {
                 let calls = self.calls();
                 assert!(!calls.is_empty());
+                let prefix = "-o ControlMaster=auto -o ControlPersist=10m -o ControlPath=~/.ssh/devsync-%C example sh -c '";
                 assert!(
-                    calls.lines().all(|call| call.starts_with("sh -c '")),
-                    "non-POSIX remote command in:\n{calls}"
+                    calls.lines().all(|call| call.starts_with(prefix)),
+                    "SSH invocation missing required options or POSIX shell in:\n{calls}"
                 );
             }
         }
@@ -405,7 +413,7 @@ mod tests {
             assert_eq!(calls.matches("test -f").count(), 1);
             assert_eq!(calls.matches("exec \"$cache\"").count(), 2);
             assert!(!calls.contains("cat >\"$tmp\""));
-            fixture.assert_all_calls_use_posix_shell();
+            fixture.assert_all_calls_use_required_ssh_options_and_posix_shell();
         }
 
         #[test]
@@ -427,7 +435,7 @@ mod tests {
             assert_eq!(calls.matches("test -f").count(), 1);
             assert_eq!(calls.matches("cat >\"$tmp\"").count(), 1);
             assert_eq!(calls.matches("exec \"$cache\"").count(), 2);
-            fixture.assert_all_calls_use_posix_shell();
+            fixture.assert_all_calls_use_required_ssh_options_and_posix_shell();
         }
     }
 }
