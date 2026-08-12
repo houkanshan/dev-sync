@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 use crate::snapshot::{Entry, Generation};
 
 const MAX_JSON_FRAME: usize = 64 * 1024 * 1024;
+pub const PROTOCOL_VERSION: u32 = 1;
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "mode", rename_all = "snake_case")]
@@ -24,24 +25,49 @@ pub enum PlanKind {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct Plan {
     pub expected_generation: Generation,
+    pub expected_state_id: String,
     pub generation: Generation,
+    pub state_id: String,
     #[serde(flatten)]
     pub kind: PlanKind,
+}
+
+impl Plan {
+    pub fn entry(&self, path: &PathBuf) -> Option<&Entry> {
+        match &self.kind {
+            PlanKind::Full { entries } => entries.get(path),
+            PlanKind::Delta { changes } => changes.get(path).and_then(Option::as_ref),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ClientMessage {
+    Hello { version: u32 },
     Plan(Plan),
     Payload { path: PathBuf, length: u64 },
+    Done,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum AgentMessage {
-    NeedPayloads { paths: Vec<PathBuf> },
-    Ack { generation: Generation },
-    Error { message: String },
+    Hello {
+        version: u32,
+        generation: Generation,
+        state_id: String,
+    },
+    NeedPayloads {
+        paths: Vec<PathBuf>,
+    },
+    Ack {
+        generation: Generation,
+        state_id: String,
+    },
+    Error {
+        message: String,
+    },
 }
 
 pub fn write_json<W: Write, T: Serialize>(writer: &mut W, value: &T) -> Result<()> {

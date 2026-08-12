@@ -6,8 +6,10 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
 
-use crate::protocol::{AgentMessage, ClientMessage, Plan, PlanKind, read_json, write_json};
-use crate::snapshot::{Entry, Snapshot, validate_relative_path};
+use crate::protocol::{
+    AgentMessage, ClientMessage, PROTOCOL_VERSION, Plan, PlanKind, read_json, write_json,
+};
+use crate::snapshot::{Entry, Snapshot, state_id, validate_entries, validate_paths};
 
 pub fn serve<R: Read, W: Write>(
     root: &Path,
@@ -35,11 +37,32 @@ fn serve_session<R: Read, W: Write>(
 ) -> Result<()> {
     fs::create_dir_all(root).with_context(|| format!("create target root {}", root.display()))?;
     let snapshot = load_snapshot(state_path)?;
+    let Some(ClientMessage::Hello { version }) = read_json(input)? else {
+        bail!("expected hello as first protocol message");
+    };
+    if version != PROTOCOL_VERSION {
+        bail!("unsupported protocol version {version}; expected {PROTOCOL_VERSION}");
+    }
+    write_json(
+        &mut *output,
+        &AgentMessage::Hello {
+            version: PROTOCOL_VERSION,
+            generation: snapshot.generation,
+            state_id: state_id(&snapshot.entries)?,
+        },
+    )?;
     let Some(ClientMessage::Plan(plan)) = read_json(input)? else {
-        bail!("expected plan as first protocol message");
+        bail!("expected plan after hello");
     };
     let desired = desired_snapshot(&snapshot, &plan)?;
-    let needed = needed_payloads(root, &desired)?;
+    let candidates = match &plan.kind {
+        PlanKind::Full { entries } => entries.clone(),
+        PlanKind::Delta { changes } => changes
+            .iter()
+            .filter_map(|(path, entry)| entry.clone().map(|entry| (path.clone(), entry)))
+            .collect(),
+    };
+    let needed = needed_payloads(root, &candidates)?;
     write_json(
         &mut *output,
         &AgentMessage::NeedPayloads {
@@ -70,30 +93,35 @@ fn serve_session<R: Read, W: Write>(
             &desired.entries[&path],
         )?;
     }
+    let Some(ClientMessage::Done) = read_json(input)? else {
+        bail!("expected payload completion message");
+    };
 
-    apply(
-        root,
-        stage.path(),
-        &snapshot,
-        &desired,
-        matches!(plan.kind, PlanKind::Full { .. }),
-    )?;
+    // Application is intentionally per-path. If it is interrupted, the persisted
+    // generation is unchanged and the next client must recover with full reconciliation.
+    apply(root, stage.path(), &snapshot, &desired)?;
     save_snapshot(state_path, &desired)?;
     write_json(
         output,
         &AgentMessage::Ack {
             generation: desired.generation,
+            state_id: state_id(&desired.entries)?,
         },
     )?;
     Ok(())
 }
 
 fn desired_snapshot(previous: &Snapshot, plan: &Plan) -> Result<Snapshot> {
-    if plan.expected_generation != previous.generation {
+    let previous_state_id = state_id(&previous.entries)?;
+    if plan.expected_generation != previous.generation
+        || plan.expected_state_id != previous_state_id
+    {
         bail!(
-            "generation mismatch: expected {}, remote is {}",
+            "remote state mismatch: expected generation {} state {}, remote is generation {} state {}",
             plan.expected_generation,
-            previous.generation
+            plan.expected_state_id,
+            previous.generation,
+            previous_state_id
         );
     }
     if plan.generation <= previous.generation {
@@ -116,13 +144,17 @@ fn desired_snapshot(previous: &Snapshot, plan: &Plan) -> Result<Snapshot> {
             entries
         }
     };
-    for path in entries.keys() {
-        validate_relative_path(path)?;
-    }
+    validate_entries(&entries)?;
     if let PlanKind::Delta { changes } = &plan.kind {
-        for path in changes.keys() {
-            validate_relative_path(path)?;
-        }
+        validate_paths(changes.keys())?;
+    }
+    let desired_state_id = state_id(&entries)?;
+    if desired_state_id != plan.state_id {
+        bail!(
+            "plan state identity mismatch: declared {}, computed {}",
+            plan.state_id,
+            desired_state_id
+        );
     }
     Ok(Snapshot {
         generation: plan.generation,
@@ -130,28 +162,41 @@ fn desired_snapshot(previous: &Snapshot, plan: &Plan) -> Result<Snapshot> {
     })
 }
 
-fn needed_payloads(root: &Path, desired: &Snapshot) -> Result<BTreeSet<PathBuf>> {
+fn needed_payloads(
+    root: &Path,
+    candidates: &std::collections::BTreeMap<PathBuf, Entry>,
+) -> Result<BTreeSet<PathBuf>> {
     let mut needed = BTreeSet::new();
-    for (path, entry) in &desired.entries {
+    for (path, entry) in candidates {
         if !entry.needs_payload() {
             continue;
         }
-        let actual = match Entry::from_path(&root.join(path)) {
-            Ok(actual) => Some(actual),
-            Err(error)
-                if error
-                    .downcast_ref::<std::io::Error>()
-                    .is_some_and(|error| error.kind() == std::io::ErrorKind::NotFound) =>
-            {
-                None
-            }
-            Err(_) => None,
+        let actual = if has_safe_real_parents(root, path)? {
+            Entry::from_path(&root.join(path)).ok()
+        } else {
+            None
         };
         if !actual.is_some_and(|actual| entry.content_matches(&actual)) {
             needed.insert(path.clone());
         }
     }
     Ok(needed)
+}
+
+fn has_safe_real_parents(root: &Path, relative: &Path) -> Result<bool> {
+    let mut current = root.to_path_buf();
+    if let Some(parent) = relative.parent() {
+        for component in parent.components() {
+            current.push(component.as_os_str());
+            match fs::symlink_metadata(&current) {
+                Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {}
+                Ok(_) => return Ok(false),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+                Err(error) => return Err(error.into()),
+            }
+        }
+    }
+    Ok(true)
 }
 
 fn receive_payload<R: Read>(
@@ -195,28 +240,16 @@ fn receive_payload<R: Read>(
     Ok(())
 }
 
-fn apply(
-    root: &Path,
-    stage: &Path,
-    previous: &Snapshot,
-    desired: &Snapshot,
-    full: bool,
-) -> Result<()> {
-    let mut removals: Vec<_> = if full {
-        actual_paths(root)?
-            .into_iter()
-            .filter(|path| !desired.entries.contains_key(path))
-            .collect()
-    } else {
-        previous
-            .entries
-            .keys()
-            .filter(|path| !desired.entries.contains_key(*path))
-            .cloned()
-            .collect()
-    };
+fn apply(root: &Path, stage: &Path, previous: &Snapshot, desired: &Snapshot) -> Result<()> {
+    let mut removals: Vec<_> = previous
+        .entries
+        .keys()
+        .filter(|path| !desired.entries.contains_key(*path))
+        .cloned()
+        .collect();
     removals.sort_by_key(|path| std::cmp::Reverse(path.components().count()));
     for path in removals {
+        ensure_safe_parent(root, &path)?;
         remove_any(&root.join(path))?;
     }
 
@@ -283,27 +316,6 @@ fn remove_any(path: &Path) -> Result<()> {
     Ok(())
 }
 
-fn actual_paths(root: &Path) -> Result<BTreeSet<PathBuf>> {
-    fn visit(root: &Path, relative: &Path, paths: &mut BTreeSet<PathBuf>) -> Result<()> {
-        for child in fs::read_dir(root.join(relative))? {
-            let child = child?;
-            let path = relative.join(child.file_name());
-            let metadata = fs::symlink_metadata(child.path())?;
-            if metadata.is_dir() && !metadata.file_type().is_symlink() {
-                visit(root, &path, paths)?;
-            } else {
-                validate_relative_path(&path)?;
-                paths.insert(path);
-            }
-        }
-        Ok(())
-    }
-
-    let mut paths = BTreeSet::new();
-    visit(root, Path::new(""), &mut paths)?;
-    Ok(paths)
-}
-
 fn load_snapshot(path: &Path) -> Result<Snapshot> {
     match fs::read(path) {
         Ok(bytes) => Ok(serde_json::from_slice(&bytes).context("parse agent snapshot")?),
@@ -352,21 +364,26 @@ mod tests {
         let state = temp.path().join("state/snapshot.json");
         fs::create_dir_all(state.parent().unwrap()).unwrap();
 
+        let first_entries = BTreeMap::from([
+            (PathBuf::from("bin/run"), entry(b"one", true)),
+            (
+                PathBuf::from("link"),
+                Entry::Symlink {
+                    target: "bin/run".into(),
+                },
+            ),
+        ]);
         let first = Plan {
             expected_generation: 0,
+            expected_state_id: state_id(&BTreeMap::new()).unwrap(),
             generation: 1,
+            state_id: state_id(&first_entries).unwrap(),
             kind: PlanKind::Full {
-                entries: BTreeMap::from([
-                    (PathBuf::from("bin/run"), entry(b"one", true)),
-                    (
-                        PathBuf::from("link"),
-                        Entry::Symlink {
-                            target: "bin/run".into(),
-                        },
-                    ),
-                ]),
+                entries: first_entries,
             },
         };
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("unmanaged"), b"keep me").unwrap();
         transact(&root, &state, first, &[(PathBuf::from("bin/run"), b"one")]);
         assert_eq!(fs::read(root.join("bin/run")).unwrap(), b"one");
         assert_eq!(
@@ -383,9 +400,12 @@ mod tests {
         );
 
         fs::write(root.join("bin/run"), b"remote drift").unwrap();
+        let second_entries = BTreeMap::from([(PathBuf::from("bin/run"), entry(b"two", false))]);
         let second = Plan {
             expected_generation: 1,
+            expected_state_id: state_id(&load_snapshot(&state).unwrap().entries).unwrap(),
             generation: 2,
+            state_id: state_id(&second_entries).unwrap(),
             kind: PlanKind::Delta {
                 changes: BTreeMap::from([
                     (PathBuf::from("bin/run"), Some(entry(b"two", false))),
@@ -397,6 +417,40 @@ mod tests {
         assert_eq!(fs::read(root.join("bin/run")).unwrap(), b"two");
         assert!(!root.join("link").exists());
         assert_eq!(load_snapshot(&state).unwrap().generation, 2);
+        assert_eq!(fs::read(root.join("unmanaged")).unwrap(), b"keep me");
+    }
+
+    #[test]
+    fn requests_payload_without_following_symlink_parent() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("root");
+        let outside = temp.path().join("outside");
+        fs::create_dir_all(&root).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        fs::write(outside.join("file"), b"matching").unwrap();
+        symlink(&outside, root.join("parent")).unwrap();
+        let candidates =
+            BTreeMap::from([(PathBuf::from("parent/file"), entry(b"matching", false))]);
+        assert_eq!(
+            needed_payloads(&root, &candidates).unwrap(),
+            BTreeSet::from([PathBuf::from("parent/file")])
+        );
+    }
+
+    #[test]
+    fn rejects_colliding_desired_paths() {
+        let entries = BTreeMap::from([
+            (PathBuf::from("path"), entry(b"one", false)),
+            (PathBuf::from("path/child"), entry(b"two", false)),
+        ]);
+        let plan = Plan {
+            expected_generation: 0,
+            expected_state_id: state_id(&BTreeMap::new()).unwrap(),
+            generation: 1,
+            state_id: "invalid".into(),
+            kind: PlanKind::Full { entries },
+        };
+        assert!(desired_snapshot(&Snapshot::default(), &plan).is_err());
     }
 
     #[test]
@@ -412,14 +466,24 @@ mod tests {
             },
         )
         .unwrap();
+        let empty_state_id = state_id(&BTreeMap::new()).unwrap();
         let plan = ClientMessage::Plan(Plan {
             expected_generation: 3,
+            expected_state_id: empty_state_id.clone(),
             generation: 5,
+            state_id: empty_state_id,
             kind: PlanKind::Full {
                 entries: BTreeMap::new(),
             },
         });
         let mut input = Vec::new();
+        write_json(
+            &mut input,
+            &ClientMessage::Hello {
+                version: PROTOCOL_VERSION,
+            },
+        )
+        .unwrap();
         write_json(&mut input, &plan).unwrap();
         assert!(serve(&root, &state, input.as_slice(), Vec::new()).is_err());
         assert_eq!(load_snapshot(&state).unwrap().generation, 4);
@@ -427,6 +491,13 @@ mod tests {
 
     fn transact(root: &Path, state: &Path, plan: Plan, payloads: &[(PathBuf, &[u8])]) {
         let mut input = Vec::new();
+        write_json(
+            &mut input,
+            &ClientMessage::Hello {
+                version: PROTOCOL_VERSION,
+            },
+        )
+        .unwrap();
         write_json(&mut input, &ClientMessage::Plan(plan)).unwrap();
         for (path, bytes) in payloads {
             write_json(
@@ -439,9 +510,14 @@ mod tests {
             .unwrap();
             input.extend_from_slice(bytes);
         }
+        write_json(&mut input, &ClientMessage::Done).unwrap();
         let mut output = Vec::new();
         serve(root, state, Cursor::new(input), &mut output).unwrap();
         let mut output = output.as_slice();
+        assert!(matches!(
+            read_json::<_, AgentMessage>(&mut output).unwrap(),
+            Some(AgentMessage::Hello { .. })
+        ));
         assert!(matches!(
             read_json::<_, AgentMessage>(&mut output).unwrap(),
             Some(AgentMessage::NeedPayloads { .. })

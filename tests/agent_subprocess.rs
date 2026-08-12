@@ -5,7 +5,7 @@ use std::path::PathBuf;
 use std::process::{Command, Stdio};
 
 use devsync::protocol::{Plan, PlanKind};
-use devsync::snapshot::Entry;
+use devsync::snapshot::{Entry, state_id};
 use devsync::transport::transact;
 
 #[test]
@@ -19,20 +19,21 @@ fn local_agent_subprocess_requests_and_applies_whole_file() {
     fs::set_permissions(local.join("run"), fs::Permissions::from_mode(0o755)).unwrap();
 
     let bytes = fs::read(local.join("run")).unwrap();
+    let entries = BTreeMap::from([(
+        PathBuf::from("run"),
+        Entry::File {
+            digest: blake3::hash(&bytes).to_hex().to_string(),
+            size: bytes.len() as u64,
+            modified_ns: 0,
+            executable: true,
+        },
+    )]);
     let plan = Plan {
         expected_generation: 0,
+        expected_state_id: state_id(&BTreeMap::new()).unwrap(),
         generation: 1,
-        kind: PlanKind::Full {
-            entries: BTreeMap::from([(
-                PathBuf::from("run"),
-                Entry::File {
-                    digest: blake3::hash(&bytes).to_hex().to_string(),
-                    size: bytes.len() as u64,
-                    modified_ns: 0,
-                    executable: true,
-                },
-            )]),
-        },
+        state_id: state_id(&entries).unwrap(),
+        kind: PlanKind::Full { entries },
     };
 
     let mut child = Command::new(env!("CARGO_BIN_EXE_devsync-agent"))

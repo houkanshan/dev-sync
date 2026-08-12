@@ -93,6 +93,13 @@ impl Entry {
     }
 }
 
+pub fn state_id(entries: &BTreeMap<PathBuf, Entry>) -> Result<String> {
+    validate_entries(entries)?;
+    Ok(blake3::hash(&serde_json::to_vec(entries)?)
+        .to_hex()
+        .to_string())
+}
+
 pub fn validate_relative_path(path: &Path) -> Result<()> {
     if path.as_os_str().is_empty()
         || path.is_absolute()
@@ -106,18 +113,44 @@ pub fn validate_relative_path(path: &Path) -> Result<()> {
     Ok(())
 }
 
+pub fn validate_paths<'a>(paths: impl IntoIterator<Item = &'a PathBuf>) -> Result<()> {
+    let mut seen = std::collections::BTreeSet::new();
+    for path in paths {
+        validate_relative_path(path)?;
+        let mut ancestor = path.parent();
+        while let Some(parent) = ancestor {
+            if seen.contains(parent) {
+                bail!(
+                    "managed paths collide: {} is an ancestor of {}",
+                    parent.display(),
+                    path.display()
+                );
+            }
+            ancestor = parent.parent();
+        }
+        seen.insert(path.clone());
+    }
+    Ok(())
+}
+
+pub fn validate_entries(entries: &BTreeMap<PathBuf, Entry>) -> Result<()> {
+    validate_paths(entries.keys())
+}
+
 pub fn scan_paths(
     root: &Path,
     paths: impl IntoIterator<Item = PathBuf>,
 ) -> Result<BTreeMap<PathBuf, Entry>> {
-    paths
+    let entries = paths
         .into_iter()
         .map(|path| {
             validate_relative_path(&path)?;
             let entry = Entry::from_path(&root.join(&path))?;
             Ok((path, entry))
         })
-        .collect()
+        .collect::<Result<BTreeMap<_, _>>>()?;
+    validate_entries(&entries)?;
+    Ok(entries)
 }
 
 #[cfg(test)]
@@ -130,6 +163,25 @@ mod tests {
             assert!(validate_relative_path(Path::new(path)).is_err(), "{path}");
         }
         assert!(validate_relative_path(Path::new("a/b")).is_ok());
+    }
+
+    #[test]
+    fn rejects_ancestor_descendant_entries() {
+        let entries = BTreeMap::from([
+            (
+                PathBuf::from("a"),
+                Entry::Symlink {
+                    target: "target".into(),
+                },
+            ),
+            (
+                PathBuf::from("a/b"),
+                Entry::Symlink {
+                    target: "target".into(),
+                },
+            ),
+        ]);
+        assert!(validate_entries(&entries).is_err());
     }
 
     #[test]
