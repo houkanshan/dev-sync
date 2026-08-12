@@ -59,8 +59,7 @@ impl Deployment {
     }
 
     pub fn launch(&self) -> Result<AgentChild> {
-        let mut child = ssh(&self.ssh_program, &self.remote)
-            .arg(posix_command(&self.command))
+        let mut child = remote_sh(&self.ssh_program, &self.remote, &self.command)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -100,8 +99,7 @@ impl AgentChild {
 }
 
 fn ensure_installed(ssh_program: &Path, remote: &str, digest: &str, bytes: &[u8]) -> Result<()> {
-    let output = ssh(ssh_program, remote)
-        .arg(posix_command(&installed_command(digest)))
+    let output = remote_sh(ssh_program, remote, &installed_command(digest))
         .stdin(Stdio::null())
         .output()
         .context("check remote agent installation")?;
@@ -116,8 +114,7 @@ fn ensure_installed(ssh_program: &Path, remote: &str, digest: &str, bytes: &[u8]
         );
     }
 
-    let mut installer = ssh(ssh_program, remote)
-        .arg(posix_command(&install_command(digest)))
+    let mut installer = remote_sh(ssh_program, remote, &install_command(digest))
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
@@ -129,7 +126,6 @@ fn ensure_installed(ssh_program: &Path, remote: &str, digest: &str, bytes: &[u8]
     let output = installer
         .wait_with_output()
         .context("wait for remote agent installer")?;
-    upload?;
     if !output.status.success() {
         bail!(
             "remote agent installation failed with {}: {}",
@@ -137,6 +133,7 @@ fn ensure_installed(ssh_program: &Path, remote: &str, digest: &str, bytes: &[u8]
             String::from_utf8_lossy(&output.stderr).trim()
         );
     }
+    upload?;
     Ok(())
 }
 
@@ -145,13 +142,16 @@ pub fn probe(remote: &str) -> Result<Platform> {
 }
 
 fn probe_with(ssh_program: &Path, remote: &str) -> Result<Platform> {
-    let output = ssh(ssh_program, remote)
-        .arg(posix_command("uname -s; uname -m"))
+    let output = remote_sh(ssh_program, remote, "uname -s; uname -m")
         .stdin(Stdio::null())
         .output()
         .context("probe remote platform")?;
     if !output.status.success() {
-        bail!("remote platform probe failed with {}", output.status);
+        bail!(
+            "remote platform probe failed with {}: {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
     }
     let text = String::from_utf8(output.stdout).context("remote uname was not UTF-8")?;
     let mut lines = text.lines();
@@ -213,9 +213,12 @@ fn artifact_dir() -> Result<PathBuf> {
         .to_path_buf())
 }
 
-fn ssh(program: &Path, remote: &str) -> Command {
+fn remote_sh(program: &Path, remote: &str, script: &str) -> Command {
     let mut command = Command::new(program);
-    command.args(SSH_OPTIONS).arg(remote);
+    command
+        .args(SSH_OPTIONS)
+        .arg(remote)
+        .arg(posix_command(script));
     command
 }
 
@@ -376,6 +379,15 @@ mod tests {
             fn calls(&self) -> String {
                 fs::read_to_string(&self.log).unwrap()
             }
+
+            fn assert_all_calls_use_posix_shell(&self) {
+                let calls = self.calls();
+                assert!(!calls.is_empty());
+                assert!(
+                    calls.lines().all(|call| call.starts_with("sh -c '")),
+                    "non-POSIX remote command in:\n{calls}"
+                );
+            }
         }
 
         #[test]
@@ -393,6 +405,7 @@ mod tests {
             assert_eq!(calls.matches("test -f").count(), 1);
             assert_eq!(calls.matches("exec \"$cache\"").count(), 2);
             assert!(!calls.contains("cat >\"$tmp\""));
+            fixture.assert_all_calls_use_posix_shell();
         }
 
         #[test]
@@ -414,6 +427,7 @@ mod tests {
             assert_eq!(calls.matches("test -f").count(), 1);
             assert_eq!(calls.matches("cat >\"$tmp\"").count(), 1);
             assert_eq!(calls.matches("exec \"$cache\"").count(), 2);
+            fixture.assert_all_calls_use_posix_shell();
         }
     }
 }
