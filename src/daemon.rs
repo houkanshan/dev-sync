@@ -38,7 +38,10 @@ struct State {
 }
 
 enum Work {
-    Changed(BTreeSet<PathBuf>),
+    Changed {
+        paths: BTreeSet<PathBuf>,
+        reconcile: bool,
+    },
     Flush(oneshot::Sender<Result<(), String>>),
     Stop(oneshot::Sender<Result<(), String>>),
 }
@@ -67,7 +70,12 @@ pub async fn run(root: PathBuf) -> Result<()> {
         let state = Arc::clone(&state);
         move || worker_loop(root, config, state, work_rx)
     });
-    work_tx.send(Work::Changed(BTreeSet::new())).await?;
+    work_tx
+        .send(Work::Changed {
+            paths: BTreeSet::new(),
+            reconcile: true,
+        })
+        .await?;
 
     let watcher = tokio::spawn(watch(project.root.clone(), work_tx.clone()));
     let mut stopping = false;
@@ -104,13 +112,14 @@ async fn watch_once(root: &std::path::Path, work_tx: &mpsc::Sender<Work>) -> Res
     loop {
         match subscription.next().await? {
             SubscriptionData::FilesChanged(result) => {
-                let changed = result
+                let reconcile = result.is_fresh_instance;
+                let paths = result
                     .files
                     .unwrap_or_default()
                     .into_iter()
                     .map(|file| file.name.into_inner())
                     .collect();
-                work_tx.send(Work::Changed(changed)).await?;
+                work_tx.send(Work::Changed { paths, reconcile }).await?;
             }
             SubscriptionData::Canceled => bail!("subscription canceled"),
             SubscriptionData::StateEnter { .. } | SubscriptionData::StateLeave { .. } => {}
@@ -130,10 +139,11 @@ fn worker_loop(
         let mut changed = BTreeSet::new();
         let mut flushes = Vec::new();
         let mut stop = None;
-        collect_work(first, &mut changed, &mut flushes, &mut stop);
+        let mut reconcile = false;
+        collect_work(first, &mut changed, &mut reconcile, &mut flushes, &mut stop);
         std::thread::sleep(Duration::from_millis(20));
         while let Ok(work) = work_rx.try_recv() {
-            collect_work(work, &mut changed, &mut flushes, &mut stop);
+            collect_work(work, &mut changed, &mut reconcile, &mut flushes, &mut stop);
         }
         let barrier = !flushes.is_empty() || stop.is_some();
         runtime.block_on(async {
@@ -143,7 +153,7 @@ fn worker_loop(
         });
         let result = (|| {
             let current = sync::manifest(&root)?;
-            if known.is_empty() || barrier || sync::needs_reconcile(&changed) {
+            if known.is_empty() || reconcile || barrier || sync::needs_reconcile(&changed) {
                 sync::reconcile(&root, &config, &current)?;
             } else {
                 sync::apply_delta(&root, &config, &changed, &known, &current)?;
@@ -155,6 +165,9 @@ fn worker_loop(
             .as_ref()
             .map(|_| ())
             .map_err(|error| format!("{error:#}"));
+        if result.is_err() {
+            known.clear();
+        }
         runtime.block_on(async {
             let mut state = state.lock().await;
             state.syncing = false;
@@ -180,11 +193,18 @@ fn worker_loop(
 fn collect_work(
     work: Work,
     changed: &mut BTreeSet<PathBuf>,
+    reconcile: &mut bool,
     flushes: &mut Vec<oneshot::Sender<Result<(), String>>>,
     stop: &mut Option<oneshot::Sender<Result<(), String>>>,
 ) {
     match work {
-        Work::Changed(paths) => changed.extend(paths),
+        Work::Changed {
+            paths,
+            reconcile: must_reconcile,
+        } => {
+            changed.extend(paths);
+            *reconcile |= must_reconcile;
+        }
         Work::Flush(reply) => flushes.push(reply),
         Work::Stop(reply) => *stop = Some(reply),
     }

@@ -11,6 +11,7 @@ use crate::project::Config;
 pub const RECONCILE_PATHS: [&str; 2] = [".dev-syncignore", ".git/info/exclude"];
 const REMOTE_MANIFEST: &str = ".dev-sync-manifest";
 const NEW_MANIFEST: &str = ".dev-sync-manifest.new";
+const UPLOAD_MANIFEST: &str = ".dev-sync-uploads";
 
 pub fn manifest(root: &Path) -> Result<BTreeSet<PathBuf>> {
     let mut command = Command::new("git");
@@ -44,8 +45,7 @@ pub fn manifest(root: &Path) -> Result<BTreeSet<PathBuf>> {
         if root.join(&path).symlink_metadata().is_ok()
             && !custom_ignored.contains(&path)
             && path != Path::new(".dev-sync.toml")
-            && path != Path::new(REMOTE_MANIFEST)
-            && path != Path::new(NEW_MANIFEST)
+            && !is_reserved(&path)
         {
             paths.insert(path);
         }
@@ -87,11 +87,7 @@ fn custom_ignored_tracked(root: &Path) -> Result<BTreeSet<PathBuf>> {
 }
 
 pub fn reconcile(root: &Path, config: &Config, files: &BTreeSet<PathBuf>) -> Result<usize> {
-    let remote = shell_quote(&config.remote_path);
-    let script = format!(
-        "set -eu; root={remote}; mkdir -p \"$root\"; tar -xf - -C \"$root\"; old=\"$root/{REMOTE_MANIFEST}\"; new=\"$root/{NEW_MANIFEST}\"; if [ -f \"$old\" ]; then comm -23 \"$old\" \"$new\" | while IFS= read -r path; do rm -rf \"$root/$path\"; done; fi; mv \"$new\" \"$old\""
-    );
-    transfer(root, config, files.iter(), files, &script)?;
+    transfer(root, config, files.iter(), files)?;
     Ok(files.len())
 }
 
@@ -103,24 +99,15 @@ pub fn apply_delta(
     current: &BTreeSet<PathBuf>,
 ) -> Result<usize> {
     let uploads: BTreeSet<_> = changed.intersection(current).cloned().collect();
-    let deletions: Vec<_> = changed
+    let deleted = changed
         .intersection(previous)
-        .filter(|path| !current.contains(*path))
-        .collect();
-    if uploads.is_empty() && deletions.is_empty() {
+        .any(|path| !current.contains(path));
+    if uploads.is_empty() && !deleted {
         return Ok(0);
     }
-
-    let remote = shell_quote(&config.remote_path);
-    let deletes = deletions
-        .iter()
-        .map(|path| format!("rm -rf {}/{};", remote, shell_quote_path(path)))
-        .collect::<String>();
-    let script = format!(
-        "set -eu; root={remote}; mkdir -p \"$root\"; tar -xf - -C \"$root\"; {deletes} mv \"$root/{NEW_MANIFEST}\" \"$root/{REMOTE_MANIFEST}\""
-    );
-    transfer(root, config, uploads.iter(), current, &script)?;
-    Ok(uploads.len() + deletions.len())
+    let count = uploads.len() + usize::from(deleted);
+    transfer(root, config, uploads.iter(), current)?;
+    Ok(count)
 }
 
 pub fn needs_reconcile(paths: &BTreeSet<PathBuf>) -> bool {
@@ -137,20 +124,20 @@ fn transfer<'a>(
     config: &Config,
     uploads: impl Iterator<Item = &'a PathBuf>,
     current: &BTreeSet<PathBuf>,
-    script: &str,
 ) -> Result<()> {
+    let uploads: Vec<_> = uploads.collect();
+    let script = remote_apply_script(&config.remote_path);
+    let remote_command = format!("sh -c {}", shell_quote(&script));
     let mut child = Command::new("ssh")
         .args(["-o", "ControlMaster=auto", "-o", "ControlPersist=10m"])
         .arg(&config.remote)
-        .arg("sh")
-        .arg("-c")
-        .arg(script)
+        .arg(remote_command)
         .stdin(Stdio::piped())
         .spawn()
         .context("start ssh")?;
     let write_result = {
         let stdin = child.stdin.take().context("open ssh stdin")?;
-        write_archive(root, uploads, current, stdin)
+        write_archive(root, uploads.iter().copied(), current, stdin)
     };
     let status = child.wait().context("wait for ssh")?;
     write_result?;
@@ -160,36 +147,86 @@ fn transfer<'a>(
     Ok(())
 }
 
+fn remote_apply_script(remote_path: &str) -> String {
+    let remote = shell_quote(remote_path);
+    format!(
+        "set -eu
+root={remote}
+parent=$(dirname \"$root\")
+mkdir -p \"$root\" \"$parent\"
+stage=$(mktemp -d \"$parent/.dev-sync.XXXXXX\")
+trap 'rm -rf \"$stage\"' EXIT HUP INT TERM
+tar -xf - -C \"$stage\"
+safe_remove() {{
+  path=$1
+  [ -n \"$path\" ] || return 0
+  case \"$path\" in /*|../*|*/../*|*/..) echo \"unsafe remote path: $path\" >&2; exit 1;; esac
+  rm -rf \"$root/$path\"
+}}
+if [ -f \"$root/{REMOTE_MANIFEST}\" ]; then
+  comm -23 \"$root/{REMOTE_MANIFEST}\" \"$stage/{NEW_MANIFEST}\" | while IFS= read -r path; do safe_remove \"$path\"; done
+fi
+while IFS= read -r path; do
+  [ -n \"$path\" ] || continue
+  safe_remove \"$path\"
+done < \"$stage/{UPLOAD_MANIFEST}\"
+tar -cf - -C \"$stage\" --exclude=\"{NEW_MANIFEST}\" --exclude=\"{UPLOAD_MANIFEST}\" . | tar -xf - -C \"$root\"
+mv \"$stage/{NEW_MANIFEST}\" \"$root/{REMOTE_MANIFEST}\"
+rm -rf \"$stage\"
+trap - EXIT HUP INT TERM"
+    )
+}
+
 fn write_archive<'a>(
     root: &Path,
     uploads: impl Iterator<Item = &'a PathBuf>,
     current: &BTreeSet<PathBuf>,
     writer: impl io::Write,
 ) -> Result<()> {
+    let uploads: Vec<_> = uploads.collect();
     let mut archive = Builder::new(writer);
     archive.follow_symlinks(false);
-    for path in uploads {
+    for path in &uploads {
         archive
             .append_path_with_name(root.join(path), path)
             .with_context(|| format!("archive {}", path.display()))?;
     }
-    let manifest = current
-        .iter()
-        .map(|path| path.to_string_lossy())
-        .collect::<Vec<_>>()
-        .join("\n")
-        + "\n";
-    let mut header = Header::new_gnu();
-    header.set_size(manifest.len() as u64);
-    header.set_mode(0o600);
-    header.set_cksum();
-    archive.append_data(&mut header, NEW_MANIFEST, manifest.as_bytes())?;
+    append_control_file(&mut archive, NEW_MANIFEST, &manifest_bytes(current))?;
+    let upload_set = uploads.into_iter().cloned().collect();
+    append_control_file(&mut archive, UPLOAD_MANIFEST, &manifest_bytes(&upload_set))?;
     archive.finish()?;
     Ok(())
 }
 
+fn append_control_file(
+    archive: &mut Builder<impl io::Write>,
+    name: &str,
+    content: &[u8],
+) -> Result<()> {
+    let mut header = Header::new_gnu();
+    header.set_size(content.len() as u64);
+    header.set_mode(0o600);
+    header.set_cksum();
+    archive.append_data(&mut header, name, content)?;
+    Ok(())
+}
+
+fn manifest_bytes(paths: &BTreeSet<PathBuf>) -> Vec<u8> {
+    if paths.is_empty() {
+        return Vec::new();
+    }
+    (paths
+        .iter()
+        .map(|path| path.to_string_lossy())
+        .collect::<Vec<_>>()
+        .join("\n")
+        + "\n")
+        .into_bytes()
+}
+
 fn validate_relative_path(path: &Path) -> Result<()> {
-    if path.is_absolute()
+    if path.as_os_str().is_empty()
+        || path.is_absolute()
         || path.to_string_lossy().contains('\n')
         || path.components().any(|part| {
             matches!(
@@ -203,12 +240,14 @@ fn validate_relative_path(path: &Path) -> Result<()> {
     Ok(())
 }
 
-fn shell_quote(value: &str) -> String {
-    format!("'{}'", value.replace('\'', "'\\''"))
+fn is_reserved(path: &Path) -> bool {
+    [REMOTE_MANIFEST, NEW_MANIFEST, UPLOAD_MANIFEST]
+        .iter()
+        .any(|reserved| path == Path::new(reserved))
 }
 
-fn shell_quote_path(path: &Path) -> String {
-    shell_quote(&path.to_string_lossy())
+fn shell_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
 }
 
 #[cfg(test)]
@@ -221,9 +260,28 @@ mod tests {
     }
 
     #[test]
+    fn empty_manifest_is_zero_bytes() {
+        assert!(manifest_bytes(&BTreeSet::new()).is_empty());
+    }
+
+    #[test]
+    fn non_empty_manifest_terminates_every_record() {
+        let paths = BTreeSet::from([PathBuf::from("a"), PathBuf::from("b")]);
+        assert_eq!(manifest_bytes(&paths), b"a\nb\n");
+    }
+
+    #[test]
+    fn remote_command_is_one_shell_quoted_argument() {
+        let script = remote_apply_script("/tmp/a b'c");
+        let command = format!("sh -c {}", shell_quote(&script));
+        assert!(command.starts_with("sh -c 'set -eu"));
+        assert!(command.contains("root='\\''/tmp/a b'\\''\\'\\'''\\''c'\\''"));
+    }
+
+    #[test]
     fn detects_reconcile_inputs() {
         assert!(needs_reconcile(&BTreeSet::from([PathBuf::from(
-            ".dev-syncignore"
+            "nested/.gitignore"
         )])));
         assert!(!needs_reconcile(&BTreeSet::from([PathBuf::from(
             "src/main.rs"
