@@ -4,7 +4,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
-use chrono::{SecondsFormat, Utc};
+use chrono::{Local, SecondsFormat};
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
@@ -19,7 +19,7 @@ use crate::sync;
 fn log(message: impl std::fmt::Display) {
     eprintln!(
         "{} {message}",
-        Utc::now().to_rfc3339_opts(SecondsFormat::Millis, true)
+        Local::now().to_rfc3339_opts(SecondsFormat::Millis, true)
     );
 }
 
