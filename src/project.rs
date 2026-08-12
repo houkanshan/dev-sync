@@ -24,7 +24,7 @@ impl Project {
         let output = Command::new("git")
             .args(["rev-parse", "--show-toplevel"])
             .output()
-            .context("run git; dev-sync requires Git")?;
+            .context("run git; devsync requires Git")?;
         if !output.status.success() {
             bail!("current directory is not inside a Git worktree")
         }
@@ -34,9 +34,9 @@ impl Project {
 
     pub fn from_root(root: PathBuf) -> Self {
         let id = stable_id(&root);
-        let runtime = std::env::temp_dir().join("dev-sync");
+        let runtime = std::env::temp_dir().join("devsync");
         Self {
-            config_path: root.join(".dev-sync.toml"),
+            config_path: root.join(".devsync.toml"),
             root,
             socket_path: runtime.join(format!("{id}.sock")),
             log_path: runtime.join(format!("{id}.log")),
@@ -46,7 +46,7 @@ impl Project {
     pub fn load_config(&self) -> Result<Config> {
         let raw = std::fs::read_to_string(&self.config_path).with_context(|| {
             format!(
-                "read {}; copy .dev-sync.example.toml",
+                "read {}; copy .devsync.example.toml",
                 self.config_path.display()
             )
         })?;

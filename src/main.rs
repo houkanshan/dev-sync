@@ -13,7 +13,7 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
 
 #[derive(Parser)]
-#[command(name = "dev-sync", version, about = "Fast Git-aware development sync")]
+#[command(name = "devsync", version, about = "Fast Git-aware development sync")]
 struct Cli {
     #[command(subcommand)]
     command: Command,
@@ -108,7 +108,7 @@ async fn start(project: &Project, foreground: bool) -> Result<()> {
 async fn request(project: &Project, request: Request) -> Result<Response> {
     let stream = UnixStream::connect(&project.socket_path)
         .await
-        .with_context(|| "dev-sync is not running; run `dev-sync start`")?;
+        .with_context(|| "devsync is not running; run `devsync start`")?;
     let (reader, mut writer) = stream.into_split();
     writer
         .write_all(format!("{}\n", serde_json::to_string(&request)?).as_bytes())
@@ -137,7 +137,7 @@ mod tests {
 
     #[test]
     fn parses_foreground_start() {
-        let cli = Cli::try_parse_from(["dev-sync", "start", "--foreground"]).unwrap();
+        let cli = Cli::try_parse_from(["devsync", "start", "--foreground"]).unwrap();
         assert!(matches!(cli.command, Command::Start { foreground: true }));
     }
 }

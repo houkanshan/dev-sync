@@ -1,4 +1,4 @@
 /target/
 /bin/
-.dev-syncignore
-.dev-sync/
+.devsyncignore
+.devsync/

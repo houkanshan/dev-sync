@@ -8,10 +8,10 @@ use tar::{Builder, Header};
 
 use crate::project::Config;
 
-pub const RECONCILE_PATHS: [&str; 2] = [".dev-syncignore", ".git/info/exclude"];
-const REMOTE_MANIFEST: &str = ".dev-sync-manifest";
-const NEW_MANIFEST: &str = ".dev-sync-manifest.new";
-const UPLOAD_MANIFEST: &str = ".dev-sync-uploads";
+pub const RECONCILE_PATHS: [&str; 2] = [".devsyncignore", ".git/info/exclude"];
+const REMOTE_MANIFEST: &str = ".devsync-manifest";
+const NEW_MANIFEST: &str = ".devsync-manifest.new";
+const UPLOAD_MANIFEST: &str = ".devsync-uploads";
 
 pub fn manifest(root: &Path) -> Result<BTreeSet<PathBuf>> {
     let mut command = Command::new("git");
@@ -22,8 +22,8 @@ pub fn manifest(root: &Path) -> Result<BTreeSet<PathBuf>> {
         "--others",
         "--exclude-standard",
     ]);
-    if root.join(".dev-syncignore").is_file() {
-        command.arg("--exclude-from=.dev-syncignore");
+    if root.join(".devsyncignore").is_file() {
+        command.arg("--exclude-from=.devsyncignore");
     }
     let output = command.output().context("build Git file manifest")?;
     if !output.status.success() {
@@ -44,7 +44,7 @@ pub fn manifest(root: &Path) -> Result<BTreeSet<PathBuf>> {
         validate_relative_path(&path)?;
         if root.join(&path).symlink_metadata().is_ok()
             && !custom_ignored.contains(&path)
-            && path != Path::new(".dev-sync.toml")
+            && path != Path::new(".devsync.toml")
             && !is_reserved(&path)
         {
             paths.insert(path);
@@ -54,7 +54,7 @@ pub fn manifest(root: &Path) -> Result<BTreeSet<PathBuf>> {
 }
 
 fn custom_ignored_tracked(root: &Path) -> Result<BTreeSet<PathBuf>> {
-    if !root.join(".dev-syncignore").is_file() {
+    if !root.join(".devsyncignore").is_file() {
         return Ok(BTreeSet::new());
     }
     let output = Command::new("git")
@@ -64,10 +64,10 @@ fn custom_ignored_tracked(root: &Path) -> Result<BTreeSet<PathBuf>> {
             "-z",
             "--cached",
             "--ignored",
-            "--exclude-from=.dev-syncignore",
+            "--exclude-from=.devsyncignore",
         ])
         .output()
-        .context("apply .dev-syncignore to tracked files")?;
+        .context("apply .devsyncignore to tracked files")?;
     if !output.status.success() {
         bail!(
             "git custom-ignore query failed: {}",
@@ -154,7 +154,7 @@ fn remote_apply_script(remote_path: &str) -> String {
 root={remote}
 parent=$(dirname \"$root\")
 mkdir -p \"$root\" \"$parent\"
-stage=$(mktemp -d \"$parent/.dev-sync.XXXXXX\")
+stage=$(mktemp -d \"$parent/.devsync.XXXXXX\")
 trap 'rm -rf \"$stage\"' EXIT HUP INT TERM
 tar -xf - -C \"$stage\"
 safe_remove() {{
