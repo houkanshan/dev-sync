@@ -218,15 +218,13 @@ fn worker_loop(
             }
             break;
         }
-        let mode = if force_full
-            || reconcile
-            || !flushes.is_empty()
-            || sync::needs_reconcile(&project.root, &changed)
-        {
-            PlanMode::Full
-        } else {
-            PlanMode::Delta
-        };
+        let mode = work_mode(
+            force_full,
+            reconcile,
+            !flushes.is_empty(),
+            &project.root,
+            &changed,
+        );
         runtime.block_on(async {
             let mut state = state.lock().await;
             state.syncing = true;
@@ -330,6 +328,20 @@ fn affected_paths(kind: &devsync::protocol::PlanKind) -> BTreeSet<PathBuf> {
     match kind {
         devsync::protocol::PlanKind::Full { entries } => entries.keys().cloned().collect(),
         devsync::protocol::PlanKind::Delta { changes } => changes.keys().cloned().collect(),
+    }
+}
+
+fn work_mode(
+    force_full: bool,
+    reconcile: bool,
+    flush: bool,
+    root: &std::path::Path,
+    changed: &BTreeSet<PathBuf>,
+) -> PlanMode {
+    if force_full || reconcile || flush || sync::needs_reconcile(root, changed) {
+        PlanMode::Full
+    } else {
+        PlanMode::Delta
     }
 }
 
@@ -447,5 +459,23 @@ mod tests {
         assert!(formatted.contains("\"19.txt\""));
         assert!(!formatted.contains("\"20.txt\""));
         assert!(formatted.ends_with("... (+2 more)"));
+    }
+
+    #[test]
+    fn startup_and_flush_validate_but_draining_changes_does_not() {
+        let temp = tempfile::tempdir().unwrap();
+        let changed = BTreeSet::from([PathBuf::from("file")]);
+        assert_eq!(
+            work_mode(true, false, false, temp.path(), &changed),
+            PlanMode::Full
+        );
+        assert_eq!(
+            work_mode(false, false, true, temp.path(), &changed),
+            PlanMode::Full
+        );
+        assert_eq!(
+            work_mode(false, false, false, temp.path(), &changed),
+            PlanMode::Delta
+        );
     }
 }
