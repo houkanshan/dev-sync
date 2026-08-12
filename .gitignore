@@ -1,0 +1,4 @@
+/target/
+/bin/
+.dev-syncignore
+.dev-sync/
