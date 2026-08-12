@@ -60,7 +60,7 @@ impl Deployment {
 
     pub fn launch(&self) -> Result<AgentChild> {
         let mut child = ssh(&self.ssh_program, &self.remote)
-            .arg(&self.command)
+            .arg(posix_command(&self.command))
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -100,35 +100,42 @@ impl AgentChild {
 }
 
 fn ensure_installed(ssh_program: &Path, remote: &str, digest: &str, bytes: &[u8]) -> Result<()> {
-    let status = ssh(ssh_program, remote)
-        .arg(installed_command(digest))
+    let output = ssh(ssh_program, remote)
+        .arg(posix_command(&installed_command(digest)))
         .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
+        .output()
         .context("check remote agent installation")?;
-    if status.success() {
+    if output.status.success() {
         return Ok(());
     }
-    if status.code() != Some(1) {
-        bail!("remote agent installation check failed with {status}");
+    if output.status.code() != Some(1) {
+        bail!(
+            "remote agent installation check failed with {}: {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
     }
 
     let mut installer = ssh(ssh_program, remote)
-        .arg(install_command(digest))
+        .arg(posix_command(&install_command(digest)))
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
+        .stderr(Stdio::piped())
         .spawn()
         .context("start remote agent installer")?;
     let mut input = installer.stdin.take().context("open installer stdin")?;
     let upload = input.write_all(bytes).context("upload remote agent");
     drop(input);
-    let status = installer
-        .wait()
+    let output = installer
+        .wait_with_output()
         .context("wait for remote agent installer")?;
     upload?;
-    if !status.success() {
-        bail!("remote agent installation failed with {status}");
+    if !output.status.success() {
+        bail!(
+            "remote agent installation failed with {}: {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
     }
     Ok(())
 }
@@ -139,7 +146,7 @@ pub fn probe(remote: &str) -> Result<Platform> {
 
 fn probe_with(ssh_program: &Path, remote: &str) -> Result<Platform> {
     let output = ssh(ssh_program, remote)
-        .arg("uname -s; uname -m")
+        .arg(posix_command("uname -s; uname -m"))
         .stdin(Stdio::null())
         .output()
         .context("probe remote platform")?;
@@ -235,6 +242,10 @@ fn launch_command(digest: &str, root: &str, state_key: &str) -> String {
     )
 }
 
+fn posix_command(script: &str) -> String {
+    format!("sh -c {}", shell_quote(script))
+}
+
 fn shell_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\\''"))
 }
@@ -291,6 +302,13 @@ mod tests {
         let launch = launch_command("abc", "/tmp/a b'c", "state");
         assert!(launch.contains("--root '/tmp/a b'\\''c'"));
         assert!(launch.contains("--state \"$cache/state\"/'state.json'"));
+    }
+
+    #[test]
+    fn commands_run_through_posix_shell() {
+        let command = posix_command("value='a b'; test -n \"$value\"");
+        assert!(command.starts_with("sh -c '"));
+        assert!(command.contains("value='\\''a b'\\''"));
     }
 
     #[cfg(unix)]
