@@ -51,8 +51,14 @@ fn serve_session<R: Read, W: Write>(
             state_id: state_id(&snapshot.entries)?,
         },
     )?;
-    let Some(ClientMessage::Plan(plan)) = read_json(input)? else {
-        bail!("expected plan after hello");
+    let Some(message) = read_json(input)? else {
+        bail!("expected plan or completion after hello");
+    };
+    let ClientMessage::Plan(plan) = message else {
+        if matches!(message, ClientMessage::Complete) {
+            return Ok(());
+        }
+        bail!("expected plan or completion after hello");
     };
     let desired = desired_snapshot(&snapshot, &plan)?;
     let candidates = match &plan.kind {

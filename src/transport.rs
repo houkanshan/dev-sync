@@ -56,7 +56,9 @@ where
     };
     let plan = build_plan(&remote)?;
     if remote.generation == plan.generation && remote.state_id == plan.state_id {
-        // The prior transaction committed but its ACK was lost.
+        // The prior transaction committed but its ACK was lost. Tell the agent
+        // that no plan is needed so it can exit cleanly instead of waiting for Plan.
+        write_json(writer, &ClientMessage::Complete)?;
         return Ok(Transaction {
             plan,
             requested: BTreeSet::new(),

@@ -48,6 +48,7 @@ pub enum ClientMessage {
     Plan(Plan),
     Payload { path: PathBuf, length: u64 },
     Done,
+    Complete,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
