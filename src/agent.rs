@@ -180,7 +180,7 @@ fn needed_payloads(
         } else {
             None
         };
-        if !actual.is_some_and(|actual| entry.content_matches(&actual)) {
+        if !actual.is_some_and(|actual| entry.payload_matches(&actual)) {
             needed.insert(path.clone());
         }
     }
@@ -448,6 +448,16 @@ mod tests {
         fs::create_dir_all(&root).unwrap();
         fs::write(root.join("file"), b"matching").unwrap();
         let candidates = BTreeMap::from([(PathBuf::from("file"), entry(b"matching", false))]);
+        assert!(needed_payloads(&root, &candidates).unwrap().is_empty());
+    }
+
+    #[test]
+    fn full_mode_change_needs_no_payload() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("root");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("file"), b"matching").unwrap();
+        let candidates = BTreeMap::from([(PathBuf::from("file"), entry(b"matching", true))]);
         assert!(needed_payloads(&root, &candidates).unwrap().is_empty());
     }
 

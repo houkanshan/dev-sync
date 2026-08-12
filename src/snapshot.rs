@@ -70,6 +70,19 @@ impl Entry {
         matches!(self, Self::File { .. })
     }
 
+    pub fn payload_matches(&self, actual: &Self) -> bool {
+        matches!(
+            (self, actual),
+            (
+                Self::File { digest, .. },
+                Self::File {
+                    digest: actual_digest,
+                    ..
+                }
+            ) if digest == actual_digest
+        )
+    }
+
     pub fn content_matches(&self, actual: &Self) -> bool {
         match (self, actual) {
             (
