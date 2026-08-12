@@ -1,0 +1,156 @@
+use std::collections::BTreeMap;
+use std::fs;
+use std::io::Read;
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
+use std::path::{Component, Path, PathBuf};
+
+use anyhow::{Context, Result, bail};
+use serde::{Deserialize, Serialize};
+
+pub type Generation = u64;
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum Entry {
+    File {
+        digest: String,
+        size: u64,
+        modified_ns: i64,
+        executable: bool,
+    },
+    Symlink {
+        target: String,
+    },
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+pub struct Snapshot {
+    pub generation: Generation,
+    pub entries: BTreeMap<PathBuf, Entry>,
+}
+
+impl Entry {
+    pub fn from_path(path: &Path) -> Result<Self> {
+        let metadata = fs::symlink_metadata(path)
+            .with_context(|| format!("read metadata for {}", path.display()))?;
+        if metadata.file_type().is_symlink() {
+            let target =
+                fs::read_link(path).with_context(|| format!("read symlink {}", path.display()))?;
+            let target = target
+                .to_str()
+                .context("symlink target is not valid UTF-8")?
+                .to_owned();
+            return Ok(Self::Symlink { target });
+        }
+        if !metadata.is_file() {
+            bail!("unsupported file type: {}", path.display());
+        }
+        let mut file = fs::File::open(path)?;
+        let mut hasher = blake3::Hasher::new();
+        let mut buffer = [0; 64 * 1024];
+        loop {
+            let read = file.read(&mut buffer)?;
+            if read == 0 {
+                break;
+            }
+            hasher.update(&buffer[..read]);
+        }
+        Ok(Self::File {
+            digest: hasher.finalize().to_hex().to_string(),
+            size: metadata.size(),
+            modified_ns: metadata
+                .mtime()
+                .saturating_mul(1_000_000_000)
+                .saturating_add(metadata.mtime_nsec()),
+            executable: metadata.permissions().mode() & 0o111 != 0,
+        })
+    }
+
+    pub fn needs_payload(&self) -> bool {
+        matches!(self, Self::File { .. })
+    }
+
+    pub fn content_matches(&self, actual: &Self) -> bool {
+        match (self, actual) {
+            (
+                Self::File {
+                    digest, executable, ..
+                },
+                Self::File {
+                    digest: actual_digest,
+                    executable: actual_executable,
+                    ..
+                },
+            ) => digest == actual_digest && executable == actual_executable,
+            (
+                Self::Symlink { target },
+                Self::Symlink {
+                    target: actual_target,
+                },
+            ) => target == actual_target,
+            _ => false,
+        }
+    }
+}
+
+pub fn validate_relative_path(path: &Path) -> Result<()> {
+    if path.as_os_str().is_empty()
+        || path.is_absolute()
+        || path.to_str().is_none()
+        || path.components().any(|component| {
+            !matches!(component, Component::Normal(_)) || component.as_os_str().is_empty()
+        })
+    {
+        bail!("unsafe relative path: {}", path.display());
+    }
+    Ok(())
+}
+
+pub fn scan_paths(
+    root: &Path,
+    paths: impl IntoIterator<Item = PathBuf>,
+) -> Result<BTreeMap<PathBuf, Entry>> {
+    paths
+        .into_iter()
+        .map(|path| {
+            validate_relative_path(&path)?;
+            let entry = Entry::from_path(&root.join(&path))?;
+            Ok((path, entry))
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rejects_unsafe_paths() {
+        for path in ["", "/tmp/x", "../x", "a/../x"] {
+            assert!(validate_relative_path(Path::new(path)).is_err(), "{path}");
+        }
+        assert!(validate_relative_path(Path::new("a/b")).is_ok());
+    }
+
+    #[test]
+    fn hashes_file_content_and_mode() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("file");
+        fs::write(&path, b"hello").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+        let entry = Entry::from_path(&path).unwrap();
+        assert_eq!(
+            entry,
+            Entry::File {
+                digest: blake3::hash(b"hello").to_hex().to_string(),
+                size: 5,
+                modified_ns: fs::metadata(&path)
+                    .unwrap()
+                    .mtime()
+                    .saturating_mul(1_000_000_000)
+                    .saturating_add(fs::metadata(&path).unwrap().mtime_nsec()),
+                executable: true,
+            }
+        );
+    }
+}
