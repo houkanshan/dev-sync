@@ -15,7 +15,7 @@ use tokio::sync::{Mutex, mpsc, oneshot};
 use watchman_client::prelude::*;
 use watchman_client::{SubscriptionData, fields::NameOnly};
 
-use crate::project::{Config, Project, load_snapshot, save_snapshot};
+use crate::project::{Project, load_snapshot, save_snapshot};
 use crate::sync::{self, PlanMode};
 
 const MAX_LOGGED_PATHS: usize = 20;
@@ -84,6 +84,7 @@ pub async fn run(root: PathBuf, foreground: bool) -> Result<()> {
         let _ = std::fs::remove_file(&project.socket_path);
     }
     let config = project.load_config()?;
+    let deployment = deploy::Deployment::prepare(&config.remote, &config.remote_path)?;
     let listener = UnixListener::bind(&project.socket_path)
         .with_context(|| format!("bind {}", project.socket_path.display()))?;
     let _socket_guard = SocketGuard(project.socket_path.clone());
@@ -98,9 +99,8 @@ pub async fn run(root: PathBuf, foreground: bool) -> Result<()> {
     let (work_tx, work_rx) = mpsc::channel(128);
     let worker = tokio::task::spawn_blocking({
         let project = project.clone();
-        let config = config.clone();
         let state = Arc::clone(&state);
-        move || worker_loop(project, config, state, work_rx)
+        move || worker_loop(project, deployment, state, work_rx)
     });
     work_tx
         .send(Work::Changed {
@@ -195,7 +195,7 @@ async fn watch_once(root: &std::path::Path, work_tx: &mpsc::Sender<Work>) -> Res
 
 fn worker_loop(
     project: Project,
-    config: Config,
+    deployment: deploy::Deployment,
     state: Arc<Mutex<State>>,
     mut work_rx: mpsc::Receiver<Work>,
 ) -> Result<()> {
@@ -237,7 +237,7 @@ fn worker_loop(
         };
         let sync_started = Instant::now();
         let result =
-            sync_once(&project, &config, &acknowledged, mode, &changed).and_then(|outcome| {
+            sync_once(&project, &deployment, &acknowledged, mode, &changed).and_then(|outcome| {
                 let next = sync::committed_snapshot(&acknowledged, &outcome.plan);
                 save_snapshot(&project.snapshot_path, &next)?;
                 Ok((outcome, next))
@@ -304,12 +304,12 @@ fn worker_loop(
 
 fn sync_once(
     project: &Project,
-    config: &Config,
+    deployment: &deploy::Deployment,
     acknowledged: &devsync::snapshot::Snapshot,
     mode: PlanMode,
     changed: &BTreeSet<PathBuf>,
 ) -> Result<transport::Transaction> {
-    let mut agent = deploy::launch(&config.remote, &config.remote_path)?;
+    let mut agent = deployment.launch()?;
     let result = transport::transact(
         &mut agent.stdout,
         &mut agent.stdin,

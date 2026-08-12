@@ -19,6 +19,61 @@ impl Platform {
     }
 }
 
+pub struct Deployment {
+    ssh_program: PathBuf,
+    remote: String,
+    command: String,
+}
+
+impl Deployment {
+    pub fn prepare(remote: &str, remote_path: &str) -> Result<Self> {
+        Self::prepare_with(
+            Path::new("ssh"),
+            remote,
+            remote_path,
+            &artifact_dir()?,
+            &native_platform(),
+        )
+    }
+
+    fn prepare_with(
+        ssh_program: &Path,
+        remote: &str,
+        remote_path: &str,
+        artifact_dir: &Path,
+        native: &Platform,
+    ) -> Result<Self> {
+        let platform = probe_with(ssh_program, remote)?;
+        let artifact = select_artifact(artifact_dir, &platform, native)?;
+        let bytes = fs::read(&artifact)
+            .with_context(|| format!("read agent artifact {}", artifact.display()))?;
+        let digest = blake3::hash(&bytes).to_hex().to_string();
+        ensure_installed(ssh_program, remote, &digest, &bytes)?;
+
+        let state_key = blake3::hash(remote_path.as_bytes()).to_hex().to_string();
+        Ok(Self {
+            ssh_program: ssh_program.to_path_buf(),
+            remote: remote.into(),
+            command: launch_command(&digest, remote_path, &state_key),
+        })
+    }
+
+    pub fn launch(&self) -> Result<AgentChild> {
+        let mut child = ssh(&self.ssh_program, &self.remote)
+            .arg(&self.command)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .context("launch remote devsync-agent")?;
+        Ok(AgentChild {
+            stdin: child.stdin.take().context("open remote agent stdin")?,
+            stdout: child.stdout.take().context("open remote agent stdout")?,
+            child,
+        })
+    }
+}
+
 pub struct AgentChild {
     child: Child,
     pub stdin: ChildStdin,
@@ -44,50 +99,48 @@ impl AgentChild {
     }
 }
 
-pub fn launch(remote: &str, remote_path: &str) -> Result<AgentChild> {
-    let platform = probe(remote)?;
-    let artifact = select_artifact(&artifact_dir()?, &platform, &native_platform())?;
-    let bytes = fs::read(&artifact)
-        .with_context(|| format!("read agent artifact {}", artifact.display()))?;
-    let digest = blake3::hash(&bytes).to_hex().to_string();
-    let install = install_command(&digest);
-    let mut installer = ssh(remote)
-        .arg(install)
+fn ensure_installed(ssh_program: &Path, remote: &str, digest: &str, bytes: &[u8]) -> Result<()> {
+    let status = ssh(ssh_program, remote)
+        .arg(installed_command(digest))
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .context("check remote agent installation")?;
+    if status.success() {
+        return Ok(());
+    }
+    if status.code() != Some(1) {
+        bail!("remote agent installation check failed with {status}");
+    }
+
+    let mut installer = ssh(ssh_program, remote)
+        .arg(install_command(digest))
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
         .spawn()
         .context("start remote agent installer")?;
-    installer
-        .stdin
-        .take()
-        .context("open installer stdin")?
-        .write_all(&bytes)?;
+    let mut input = installer.stdin.take().context("open installer stdin")?;
+    let upload = input.write_all(bytes).context("upload remote agent");
+    drop(input);
     let status = installer
         .wait()
         .context("wait for remote agent installer")?;
+    upload?;
     if !status.success() {
         bail!("remote agent installation failed with {status}");
     }
-
-    let state_key = blake3::hash(remote_path.as_bytes()).to_hex().to_string();
-    let command = launch_command(&digest, remote_path, &state_key);
-    let mut child = ssh(remote)
-        .arg(command)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .context("launch remote devsync-agent")?;
-    Ok(AgentChild {
-        stdin: child.stdin.take().context("open remote agent stdin")?,
-        stdout: child.stdout.take().context("open remote agent stdout")?,
-        child,
-    })
+    Ok(())
 }
 
 pub fn probe(remote: &str) -> Result<Platform> {
-    let output = ssh(remote)
+    probe_with(Path::new("ssh"), remote)
+}
+
+fn probe_with(ssh_program: &Path, remote: &str) -> Result<Platform> {
+    let output = ssh(ssh_program, remote)
         .arg("uname -s; uname -m")
+        .stdin(Stdio::null())
         .output()
         .context("probe remote platform")?;
     if !output.status.success() {
@@ -153,17 +206,23 @@ fn artifact_dir() -> Result<PathBuf> {
         .to_path_buf())
 }
 
-fn ssh(remote: &str) -> Command {
-    let mut command = Command::new("ssh");
+fn ssh(program: &Path, remote: &str) -> Command {
+    let mut command = Command::new(program);
     command.args(SSH_OPTIONS).arg(remote);
     command
 }
 
-fn install_command(digest: &str) -> String {
-    let name = format!("devsync-agent-{digest}");
-    let name = shell_quote(&name);
+fn installed_command(digest: &str) -> String {
+    let name = shell_quote(&format!("devsync-agent-{digest}"));
     format!(
-        "set -eu; cache=${{XDG_CACHE_HOME:-\"$HOME/.cache\"}}/devsync; mkdir -p \"$cache\"; dst=\"$cache\"/{name}; if [ ! -x \"$dst\" ]; then tmp=\"$dst.tmp.$$\"; trap 'rm -f \"$tmp\"' EXIT HUP INT TERM; cat >\"$tmp\"; chmod 700 \"$tmp\"; mv \"$tmp\" \"$dst\"; trap - EXIT HUP INT TERM; else cat >/dev/null; fi"
+        "set -eu; cache=${{XDG_CACHE_HOME:-\"$HOME/.cache\"}}/devsync; dst=\"$cache\"/{name}; test -f \"$dst\" && test -x \"$dst\""
+    )
+}
+
+fn install_command(digest: &str) -> String {
+    let name = shell_quote(&format!("devsync-agent-{digest}"));
+    format!(
+        "set -eu; cache=${{XDG_CACHE_HOME:-\"$HOME/.cache\"}}/devsync; mkdir -p \"$cache\"; dst=\"$cache\"/{name}; tmp=\"$dst.tmp.$$\"; trap 'rm -f \"$tmp\"' 0 HUP INT TERM; cat >\"$tmp\"; chmod 700 \"$tmp\"; mv \"$tmp\" \"$dst\"; trap - 0 HUP INT TERM"
     )
 }
 
@@ -222,11 +281,121 @@ mod tests {
 
     #[test]
     fn commands_quote_remote_paths_and_install_by_content() {
+        let check = installed_command("abc");
+        assert!(check.contains("test -f \"$dst\""));
+        assert!(check.contains("test -x \"$dst\""));
         let install = install_command("abc");
         assert!(install.contains("devsync-agent-abc"));
         assert!(install.contains("mv \"$tmp\" \"$dst\""));
+        assert!(!install.contains("cat >/dev/null"));
         let launch = launch_command("abc", "/tmp/a b'c", "state");
         assert!(launch.contains("--root '/tmp/a b'\\''c'"));
         assert!(launch.contains("--state \"$cache/state\"/'state.json'"));
+    }
+
+    #[cfg(unix)]
+    mod fake_ssh {
+        use std::os::unix::fs::PermissionsExt;
+
+        use super::*;
+
+        struct Fixture {
+            temp: tempfile::TempDir,
+            ssh: PathBuf,
+            marker: PathBuf,
+            log: PathBuf,
+            upload: PathBuf,
+            artifact: Vec<u8>,
+            platform: Platform,
+        }
+
+        impl Fixture {
+            fn new() -> Self {
+                let temp = tempfile::tempdir().unwrap();
+                let ssh = temp.path().join("fake-ssh");
+                let marker = temp.path().join("installed");
+                let log = temp.path().join("calls");
+                let upload = temp.path().join("upload-bytes");
+                let artifact = b"agent artifact bytes".to_vec();
+                let platform = Platform {
+                    os: "linux".into(),
+                    arch: "x86_64".into(),
+                };
+                fs::write(temp.path().join("devsync-agent-linux-x86_64"), &artifact).unwrap();
+                let script = format!(
+                    "#!/bin/sh\nset -eu\nfor command; do :; done\nprintf '%s\\n' \"$command\" >> {}\ncase \"$command\" in\n  *'uname -s; uname -m'*) printf 'Linux\\nx86_64\\n' ;;\n  *'test -f'*) [ -f {} ] ;;\n  *'cat >\"$tmp\"'*) wc -c | tr -d ' ' > {}; touch {} ;;\n  *'exec \"$cache\"'*) cat >/dev/null ;;\n  *) exit 9 ;;\nesac\n",
+                    shell_quote(log.to_str().unwrap()),
+                    shell_quote(marker.to_str().unwrap()),
+                    shell_quote(upload.to_str().unwrap()),
+                    shell_quote(marker.to_str().unwrap()),
+                );
+                fs::write(&ssh, script).unwrap();
+                let mut permissions = fs::metadata(&ssh).unwrap().permissions();
+                permissions.set_mode(0o700);
+                fs::set_permissions(&ssh, permissions).unwrap();
+                Self {
+                    temp,
+                    ssh,
+                    marker,
+                    log,
+                    upload,
+                    artifact,
+                    platform,
+                }
+            }
+
+            fn prepare(&self) -> Deployment {
+                Deployment::prepare_with(
+                    &self.ssh,
+                    "example",
+                    "/remote root",
+                    self.temp.path(),
+                    &self.platform,
+                )
+                .unwrap()
+            }
+
+            fn calls(&self) -> String {
+                fs::read_to_string(&self.log).unwrap()
+            }
+        }
+
+        #[test]
+        fn existing_agent_skips_artifact_upload_and_prepares_only_once() {
+            let fixture = Fixture::new();
+            fs::write(&fixture.marker, b"existing").unwrap();
+
+            let deployment = fixture.prepare();
+            deployment.launch().unwrap().wait().unwrap();
+            deployment.launch().unwrap().wait().unwrap();
+
+            assert!(!fixture.upload.exists());
+            let calls = fixture.calls();
+            assert_eq!(calls.matches("uname -s").count(), 1);
+            assert_eq!(calls.matches("test -f").count(), 1);
+            assert_eq!(calls.matches("exec \"$cache\"").count(), 2);
+            assert!(!calls.contains("cat >\"$tmp\""));
+        }
+
+        #[test]
+        fn missing_agent_uploads_artifact_exactly_once() {
+            let fixture = Fixture::new();
+
+            let deployment = fixture.prepare();
+            deployment.launch().unwrap().wait().unwrap();
+            deployment.launch().unwrap().wait().unwrap();
+
+            let uploaded: usize = fs::read_to_string(&fixture.upload)
+                .unwrap()
+                .trim()
+                .parse()
+                .unwrap();
+            assert_eq!(uploaded, fixture.artifact.len());
+            let calls = fixture.calls();
+            assert_eq!(calls.matches("uname -s").count(), 1);
+            assert_eq!(calls.matches("test -f").count(), 1);
+            assert_eq!(calls.matches("cat >\"$tmp\"").count(), 1);
+            assert_eq!(calls.matches("exec \"$cache\"").count(), 2);
+        }
     }
 }
