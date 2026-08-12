@@ -7,8 +7,10 @@ cargo clippy --all-targets --all-features -- -D warnings
 cargo test --all-targets
 mkdir -p bin
 cargo build --bins
-cp target/debug/devsync bin/devsync
-cp target/debug/devsync-agent bin/devsync-agent
+cp target/debug/devsync bin/devsync.new
+mv -f bin/devsync.new bin/devsync
+cp target/debug/devsync-agent bin/devsync-agent.new
+mv -f bin/devsync-agent.new bin/devsync-agent
 case "$(uname -s)-$(uname -m)" in
   Darwin-arm64) tuple=darwin-aarch64 ;;
   Darwin-x86_64) tuple=darwin-x86_64 ;;
@@ -16,4 +18,5 @@ case "$(uname -s)-$(uname -m)" in
   Linux-x86_64) tuple=linux-x86_64 ;;
   *) echo "unsupported native agent platform: $(uname -s)-$(uname -m)" >&2; exit 1 ;;
 esac
-cp target/debug/devsync-agent "bin/devsync-agent-$tuple"
+cp target/debug/devsync-agent "bin/devsync-agent-$tuple.new"
+mv -f "bin/devsync-agent-$tuple.new" "bin/devsync-agent-$tuple"
