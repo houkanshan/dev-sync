@@ -91,33 +91,42 @@ pub fn reconcile(root: &Path, config: &Config, files: &BTreeSet<PathBuf>) -> Res
     Ok(files.len())
 }
 
-pub fn delta_paths(
-    changed: &BTreeSet<PathBuf>,
-    previous: &BTreeSet<PathBuf>,
-    current: &BTreeSet<PathBuf>,
-) -> BTreeSet<PathBuf> {
-    changed
-        .iter()
-        .filter(|path| current.contains(*path) || previous.contains(*path))
-        .cloned()
-        .collect()
+pub struct DeltaPlan {
+    pub affected: BTreeSet<PathBuf>,
+    uploads: BTreeSet<PathBuf>,
+}
+
+impl DeltaPlan {
+    pub fn new(
+        changed: &BTreeSet<PathBuf>,
+        previous: &BTreeSet<PathBuf>,
+        current: &BTreeSet<PathBuf>,
+    ) -> Self {
+        let affected: BTreeSet<_> = changed
+            .iter()
+            .filter(|path| current.contains(*path) || previous.contains(*path))
+            .cloned()
+            .collect();
+        let uploads = affected.intersection(current).cloned().collect();
+        Self { affected, uploads }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.affected.is_empty()
+    }
 }
 
 pub fn apply_delta(
     root: &Path,
     config: &Config,
-    changed: &BTreeSet<PathBuf>,
-    previous: &BTreeSet<PathBuf>,
+    plan: &DeltaPlan,
     current: &BTreeSet<PathBuf>,
 ) -> Result<usize> {
-    let affected = delta_paths(changed, previous, current);
-    let uploads: BTreeSet<_> = affected.intersection(current).cloned().collect();
-    if affected.is_empty() {
+    if plan.is_empty() {
         return Ok(0);
     }
-    let count = affected.len();
-    transfer(root, config, uploads.iter(), current)?;
-    Ok(count)
+    transfer(root, config, plan.uploads.iter(), current)?;
+    Ok(plan.affected.len())
 }
 
 pub fn needs_reconcile(paths: &BTreeSet<PathBuf>) -> bool {
@@ -289,7 +298,7 @@ mod tests {
     }
 
     #[test]
-    fn delta_paths_exclude_ineligible_watchman_events() {
+    fn delta_plan_excludes_ineligible_watchman_events() {
         let changed = BTreeSet::from([
             PathBuf::from(".git"),
             PathBuf::from(".git/index.lock"),
@@ -298,8 +307,9 @@ mod tests {
         ]);
         let previous = BTreeSet::from([PathBuf::from("src/main.rs"), PathBuf::from("deleted.rs")]);
         let current = BTreeSet::from([PathBuf::from("src/main.rs")]);
+        let plan = DeltaPlan::new(&changed, &previous, &current);
         assert_eq!(
-            delta_paths(&changed, &previous, &current),
+            plan.affected,
             BTreeSet::from([PathBuf::from("deleted.rs"), PathBuf::from("src/main.rs")])
         );
     }

@@ -220,16 +220,16 @@ fn worker_loop(
         let sync_started = Instant::now();
         let result = (|| {
             let current = sync::manifest(&root)?;
-            let affected = if full_sync {
-                current.clone()
-            } else {
-                sync::delta_paths(&changed, &known, &current)
-            };
-            let did_sync = full_sync || !affected.is_empty();
+            let delta = (!full_sync).then(|| sync::DeltaPlan::new(&changed, &known, &current));
+            let affected = delta
+                .as_ref()
+                .map(|plan| &plan.affected)
+                .unwrap_or(&current);
+            let did_sync = full_sync || delta.as_ref().is_some_and(|plan| !plan.is_empty());
             if did_sync {
                 log(format!(
                     "sync {action} started; paths: {}",
-                    format_changed_paths(&affected)
+                    format_changed_paths(affected)
                 ));
             } else {
                 log(format!(
@@ -240,7 +240,12 @@ fn worker_loop(
             if full_sync {
                 sync::reconcile(&root, &config, &current)?;
             } else {
-                sync::apply_delta(&root, &config, &changed, &known, &current)?;
+                sync::apply_delta(
+                    &root,
+                    &config,
+                    delta.as_ref().expect("delta plan exists for delta sync"),
+                    &current,
+                )?;
             }
             known = current;
             Ok::<_, anyhow::Error>(did_sync)
