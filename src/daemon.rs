@@ -237,14 +237,31 @@ fn worker_loop(
             "delta"
         };
         let sync_started = Instant::now();
-        let result = sync_once(
+        let result = match sync_once(
             &project,
             &deployment,
             &mut session,
             &acknowledged,
             mode,
             &changed,
-        )
+        ) {
+            Ok(outcome) => Ok(outcome),
+            Err(first_error) => {
+                log(format!(
+                    "sync {action} attempt failed in {}ms; retrying with full validation: {first_error:#}",
+                    sync_started.elapsed().as_millis()
+                ));
+                sync_once(
+                    &project,
+                    &deployment,
+                    &mut session,
+                    &acknowledged,
+                    PlanMode::Full,
+                    &changed,
+                )
+                .with_context(|| format!("full retry after {action} failure: {first_error:#}"))
+            }
+        }
         .and_then(|outcome| {
             sync::commit_snapshot(&mut acknowledged, &outcome.plan);
             if matches!(outcome.plan.kind, devsync::protocol::PlanKind::Full { .. }) {
