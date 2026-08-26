@@ -240,6 +240,9 @@ fn worker_loop(
         } else {
             "delta"
         };
+        if mode == PlanMode::Full {
+            log("sync validate started");
+        }
         let sync_started = Instant::now();
         let result = match sync_once(
             &project,
