@@ -68,6 +68,16 @@ where
     F: FnOnce(&RemoteState) -> Result<Plan>,
 {
     let plan = build_plan(remote)?;
+    transact_plan_connected(reader, writer, remote, local_root, plan)
+}
+
+pub fn transact_plan_connected<R: Read, W: Write>(
+    reader: &mut R,
+    writer: &mut W,
+    remote: &mut RemoteState,
+    local_root: &Path,
+    plan: Plan,
+) -> Result<Transaction> {
     if !remote.recovery_required
         && remote.generation == plan.generation
         && remote.state_id == plan.state_id

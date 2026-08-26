@@ -1,6 +1,8 @@
 use std::collections::BTreeSet;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Condvar, Mutex as StdMutex};
+use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
@@ -19,6 +21,7 @@ use crate::project::{Project, load_snapshot, save_snapshot};
 use crate::sync::{self, PlanMode};
 
 const MAX_LOGGED_PATHS: usize = 20;
+const AGENT_TRANSACTION_TIMEOUT: Duration = Duration::from_secs(60);
 
 fn log(message: impl std::fmt::Display) {
     eprintln!(
@@ -334,6 +337,68 @@ fn worker_loop(
     Ok(())
 }
 
+struct AgentTimeout {
+    control: Arc<(StdMutex<bool>, Condvar)>,
+    timed_out: Arc<AtomicBool>,
+    thread: Option<JoinHandle<()>>,
+}
+
+impl AgentTimeout {
+    fn start(terminator: deploy::AgentTerminator, timeout: Duration) -> Self {
+        Self::start_with(timeout, move || {
+            let _ = terminator.terminate();
+        })
+    }
+
+    fn start_with(timeout: Duration, terminate: impl FnOnce() + Send + 'static) -> Self {
+        let control = Arc::new((StdMutex::new(false), Condvar::new()));
+        let timed_out = Arc::new(AtomicBool::new(false));
+        let thread_control = Arc::clone(&control);
+        let thread_timed_out = Arc::clone(&timed_out);
+        let thread = thread::spawn(move || {
+            let (canceled, wake) = &*thread_control;
+            let canceled = canceled.lock().expect("agent timeout lock was poisoned");
+            let (canceled, result) = wake
+                .wait_timeout_while(canceled, timeout, |canceled| !*canceled)
+                .expect("agent timeout lock was poisoned");
+            if result.timed_out() && !*canceled {
+                thread_timed_out.store(true, Ordering::Release);
+                terminate();
+            }
+        });
+        Self {
+            control,
+            timed_out,
+            thread: Some(thread),
+        }
+    }
+
+    fn finish(mut self) -> bool {
+        self.cancel();
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+        self.timed_out.load(Ordering::Acquire)
+    }
+
+    fn cancel(&self) {
+        let (canceled, wake) = &*self.control;
+        if let Ok(mut canceled) = canceled.lock() {
+            *canceled = true;
+            wake.notify_one();
+        }
+    }
+}
+
+impl Drop for AgentTimeout {
+    fn drop(&mut self) {
+        self.cancel();
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
 struct AgentSession {
     agent: deploy::AgentChild,
     remote: transport::RemoteState,
@@ -342,9 +407,19 @@ struct AgentSession {
 impl AgentSession {
     fn connect(deployment: &deploy::Deployment) -> Result<Self> {
         let mut agent = deployment.launch()?;
-        match transport::connect(&mut agent.stdout, &mut agent.stdin) {
+        let timeout = AgentTimeout::start(agent.terminator(), AGENT_TRANSACTION_TIMEOUT);
+        let result = transport::connect(&mut agent.stdout, &mut agent.stdin);
+        if timeout.finish() {
+            let _ = agent.wait();
+            bail!(
+                "remote agent handshake timed out after {}s",
+                AGENT_TRANSACTION_TIMEOUT.as_secs()
+            );
+        }
+        match result {
             Ok(remote) => Ok(Self { agent, remote }),
             Err(error) => {
+                let _ = agent.terminator().terminate();
                 let _ = agent.wait();
                 Err(error)
             }
@@ -354,22 +429,35 @@ impl AgentSession {
     fn transact(
         &mut self,
         project: &Project,
-        acknowledged: &devsync::snapshot::Snapshot,
-        mode: PlanMode,
-        changed: &BTreeSet<PathBuf>,
+        plan: devsync::protocol::Plan,
     ) -> Result<transport::Transaction> {
-        transport::transact_connected(
+        let timeout = AgentTimeout::start(self.agent.terminator(), AGENT_TRANSACTION_TIMEOUT);
+        let result = transport::transact_plan_connected(
             &mut self.agent.stdout,
             &mut self.agent.stdin,
             &mut self.remote,
             &project.root,
-            |remote| sync::Planner::new(&project.root, acknowledged).plan(mode, changed, remote),
-        )
+            plan,
+        );
+        if timeout.finish() {
+            bail!(
+                "remote agent transaction timed out after {}s",
+                AGENT_TRANSACTION_TIMEOUT.as_secs()
+            );
+        }
+        result
     }
 
     fn close(mut self) -> Result<()> {
+        let timeout = AgentTimeout::start(self.agent.terminator(), AGENT_TRANSACTION_TIMEOUT);
         let close = transport::close(&mut self.agent.stdin);
         let wait = self.agent.wait();
+        if timeout.finish() {
+            bail!(
+                "remote agent shutdown timed out after {}s",
+                AGENT_TRANSACTION_TIMEOUT.as_secs()
+            );
+        }
         match (close, wait) {
             (Ok(()), Ok(())) => Ok(()),
             (Err(error), _) | (Ok(()), Err(error)) => Err(error),
@@ -377,6 +465,7 @@ impl AgentSession {
     }
 
     fn abort(self) {
+        let _ = self.agent.terminator().terminate();
         let _ = self.agent.wait();
     }
 }
@@ -392,10 +481,14 @@ fn sync_once(
     if session.is_none() {
         *session = Some(AgentSession::connect(deployment)?);
     }
+    let plan = {
+        let session = session.as_ref().expect("agent session was initialized");
+        sync::Planner::new(&project.root, acknowledged).plan(mode, changed, &session.remote)?
+    };
     let result = session
         .as_mut()
         .expect("agent session was initialized")
-        .transact(project, acknowledged, mode, changed);
+        .transact(project, plan);
     if result.is_err() {
         session.take().expect("failed agent session exists").abort();
     }
@@ -511,6 +604,26 @@ impl Drop for SocketGuard {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn agent_timeout_can_be_canceled_or_fire() {
+        let canceled_fired = Arc::new(AtomicBool::new(false));
+        let fired = Arc::clone(&canceled_fired);
+        let timeout = AgentTimeout::start_with(Duration::from_secs(1), move || {
+            fired.store(true, Ordering::Release);
+        });
+        assert!(!timeout.finish());
+        assert!(!canceled_fired.load(Ordering::Acquire));
+
+        let elapsed_fired = Arc::new(AtomicBool::new(false));
+        let fired = Arc::clone(&elapsed_fired);
+        let timeout = AgentTimeout::start_with(Duration::from_millis(5), move || {
+            fired.store(true, Ordering::Release);
+        });
+        thread::sleep(Duration::from_millis(20));
+        assert!(timeout.finish());
+        assert!(elapsed_fired.load(Ordering::Acquire));
+    }
 
     #[test]
     fn formats_all_changed_paths_under_limit() {

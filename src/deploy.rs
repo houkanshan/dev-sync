@@ -1,17 +1,27 @@
 use std::fs;
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
+use std::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command, Stdio};
+use std::sync::{Arc, Mutex};
+use std::thread::{self, JoinHandle};
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, anyhow, bail};
 
-const SSH_OPTIONS: [&str; 6] = [
+const SSH_OPTIONS: [&str; 14] = [
     "-o",
     "ControlMaster=auto",
     "-o",
     "ControlPersist=10m",
     "-o",
     "ControlPath=~/.ssh/devsync-%C",
+    "-o",
+    "BatchMode=yes",
+    "-o",
+    "ConnectTimeout=10",
+    "-o",
+    "ServerAliveInterval=15",
+    "-o",
+    "ServerAliveCountMax=2",
 ];
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -66,43 +76,103 @@ impl Deployment {
     }
 
     pub fn launch(&self) -> Result<AgentChild> {
-        let mut child = remote_sh(&self.ssh_program, &self.remote, &self.command)
+        let child = remote_sh(&self.ssh_program, &self.remote, &self.command)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
             .context("launch remote devsync-agent")?;
-        Ok(AgentChild {
-            stdin: child.stdin.take().context("open remote agent stdin")?,
-            stdout: child.stdout.take().context("open remote agent stdout")?,
-            child,
-        })
+        AgentChild::from_child(child)
     }
 }
 
 pub struct AgentChild {
-    child: Child,
+    child: Arc<Mutex<Child>>,
+    stderr: JoinHandle<Vec<u8>>,
     pub stdin: ChildStdin,
     pub stdout: ChildStdout,
 }
 
+#[derive(Clone)]
+pub struct AgentTerminator {
+    child: Arc<Mutex<Child>>,
+}
+
+impl AgentTerminator {
+    pub fn terminate(&self) -> Result<()> {
+        let mut child = self
+            .child
+            .lock()
+            .map_err(|_| anyhow!("remote agent process lock was poisoned"))?;
+        if child.try_wait()?.is_none() {
+            child.kill().context("terminate remote agent")?;
+        }
+        Ok(())
+    }
+}
+
 impl AgentChild {
+    fn from_child(mut child: Child) -> Result<Self> {
+        let stdin = child.stdin.take().context("open remote agent stdin")?;
+        let stdout = child.stdout.take().context("open remote agent stdout")?;
+        let stderr = child.stderr.take().context("open remote agent stderr")?;
+        Ok(Self {
+            child: Arc::new(Mutex::new(child)),
+            stderr: thread::spawn(move || drain_stderr(stderr)),
+            stdin,
+            stdout,
+        })
+    }
+
+    pub fn terminator(&self) -> AgentTerminator {
+        AgentTerminator {
+            child: Arc::clone(&self.child),
+        }
+    }
+
     pub fn wait(self) -> Result<()> {
         drop(self.stdin);
         drop(self.stdout);
-        let output = self
-            .child
-            .wait_with_output()
-            .context("wait for remote agent")?;
-        if !output.status.success() {
+        let status = loop {
+            let status = self
+                .child
+                .lock()
+                .map_err(|_| anyhow!("remote agent process lock was poisoned"))?
+                .try_wait()
+                .context("wait for remote agent")?;
+            if let Some(status) = status {
+                break status;
+            }
+            thread::sleep(std::time::Duration::from_millis(10));
+        };
+        let stderr = self
+            .stderr
+            .join()
+            .map_err(|_| anyhow!("remote agent stderr reader panicked"))?;
+        if !status.success() {
             bail!(
-                "remote agent failed with {}: {}",
-                output.status,
-                String::from_utf8_lossy(&output.stderr).trim()
+                "remote agent failed with {status}: {}",
+                String::from_utf8_lossy(&stderr).trim()
             );
         }
         Ok(())
     }
+}
+
+fn drain_stderr(mut stderr: ChildStderr) -> Vec<u8> {
+    const MAX_STDERR: usize = 64 * 1024;
+    let mut tail = Vec::new();
+    let mut buffer = [0_u8; 4096];
+    while let Ok(count) = stderr.read(&mut buffer) {
+        if count == 0 {
+            break;
+        }
+        tail.extend_from_slice(&buffer[..count]);
+        if tail.len() > MAX_STDERR {
+            tail.drain(..tail.len() - MAX_STDERR);
+        }
+    }
+    tail
 }
 
 fn ensure_installed(ssh_program: &Path, remote: &str, digest: &str, bytes: &[u8]) -> Result<()> {
@@ -301,6 +371,23 @@ mod tests {
     }
 
     #[test]
+    fn terminator_stops_a_blocked_agent_child() {
+        let child = Command::new("sh")
+            .args(["-c", "exec sleep 30"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let agent = AgentChild::from_child(child).unwrap();
+        let started = std::time::Instant::now();
+
+        agent.terminator().terminate().unwrap();
+        assert!(agent.wait().is_err());
+        assert!(started.elapsed() < std::time::Duration::from_secs(2));
+    }
+
+    #[test]
     fn commands_quote_remote_paths_and_install_by_content() {
         let check = installed_command("abc");
         assert!(check.contains("test -f \"$dst\""));
@@ -390,7 +477,7 @@ mod tests {
             fn assert_all_calls_use_required_ssh_options_and_posix_shell(&self) {
                 let calls = self.calls();
                 assert!(!calls.is_empty());
-                let prefix = "-o ControlMaster=auto -o ControlPersist=10m -o ControlPath=~/.ssh/devsync-%C example sh -c '";
+                let prefix = "-o ControlMaster=auto -o ControlPersist=10m -o ControlPath=~/.ssh/devsync-%C -o BatchMode=yes -o ConnectTimeout=10 -o ServerAliveInterval=15 -o ServerAliveCountMax=2 example sh -c '";
                 assert!(
                     calls.lines().all(|call| call.starts_with(prefix)),
                     "SSH invocation missing required options or POSIX shell in:\n{calls}"
