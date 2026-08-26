@@ -381,8 +381,9 @@ fn save_snapshot(path: &Path, snapshot: &Snapshot) -> Result<()> {
             .context("state path has no file name")?
             .to_string_lossy()
     ));
-    let file = fs::File::create(&temporary)?;
-    serde_json::to_writer(&file, snapshot)?;
+    let bytes = serde_json::to_vec(snapshot)?;
+    let mut file = fs::File::create(&temporary)?;
+    file.write_all(&bytes)?;
     file.sync_all()?;
     fs::rename(&temporary, path)?;
     Ok(())

@@ -1,3 +1,4 @@
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -83,8 +84,9 @@ pub fn save_snapshot(path: &Path, snapshot: &devsync::snapshot::Snapshot) -> Res
             .context("snapshot path has no file name")?
             .to_string_lossy()
     ));
-    let file = std::fs::File::create(&temporary)?;
-    serde_json::to_writer(&file, snapshot)?;
+    let bytes = serde_json::to_vec(snapshot)?;
+    let mut file = std::fs::File::create(&temporary)?;
+    file.write_all(&bytes)?;
     file.sync_all()?;
     std::fs::rename(temporary, path)?;
     Ok(())
