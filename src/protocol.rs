@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 use crate::snapshot::{Entry, Generation};
 
 const MAX_JSON_FRAME: usize = 64 * 1024 * 1024;
-pub const PROTOCOL_VERSION: u32 = 1;
+pub const PROTOCOL_VERSION: u32 = 2;
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "mode", rename_all = "snake_case")]
@@ -58,6 +58,7 @@ pub enum AgentMessage {
         version: u32,
         generation: Generation,
         state_id: String,
+        recovery_required: bool,
     },
     NeedPayloads {
         paths: Vec<PathBuf>,

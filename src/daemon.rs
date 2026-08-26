@@ -246,12 +246,14 @@ fn worker_loop(
             &changed,
         )
         .and_then(|outcome| {
-            let next = sync::committed_snapshot(&acknowledged, &outcome.plan);
-            save_snapshot(&project.snapshot_path, &next)?;
-            Ok((outcome, next))
+            sync::commit_snapshot(&mut acknowledged, &outcome.plan);
+            if matches!(outcome.plan.kind, devsync::protocol::PlanKind::Full { .. }) {
+                save_snapshot(&project.snapshot_path, &acknowledged)?;
+            }
+            Ok(outcome)
         });
         match &result {
-            Ok((outcome, _)) => {
+            Ok(outcome) => {
                 let elapsed = sync_started.elapsed().as_millis();
                 match &outcome.plan.kind {
                     devsync::protocol::PlanKind::Full { entries } => log(format!(
@@ -284,10 +286,7 @@ fn worker_loop(
             .map(|_| ())
             .map_err(|error| format!("{error:#}"));
         match result {
-            Ok((_, next)) => {
-                acknowledged = next;
-                force_full = false;
-            }
+            Ok(_) => force_full = false,
             Err(_) => force_full = true,
         }
         runtime.block_on(async {
@@ -314,6 +313,7 @@ fn worker_loop(
     {
         log(format!("close remote agent failed: {error:#}"));
     }
+    save_snapshot(&project.snapshot_path, &acknowledged)?;
     Ok(())
 }
 

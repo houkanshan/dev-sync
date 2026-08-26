@@ -67,7 +67,9 @@ impl Project {
 
 pub fn load_snapshot(path: &Path) -> Result<devsync::snapshot::Snapshot> {
     match std::fs::read(path) {
-        Ok(bytes) => Ok(serde_json::from_slice(&bytes).context("parse local snapshot")?),
+        Ok(bytes) => serde_json::from_slice::<devsync::snapshot::Snapshot>(&bytes)
+            .context("parse local snapshot")?
+            .normalize(),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             Ok(devsync::snapshot::Snapshot::default())
         }
@@ -89,6 +91,7 @@ pub fn save_snapshot(path: &Path, snapshot: &devsync::snapshot::Snapshot) -> Res
     file.write_all(&bytes)?;
     file.sync_all()?;
     std::fs::rename(temporary, path)?;
+    std::fs::File::open(parent)?.sync_all()?;
     Ok(())
 }
 

@@ -23,10 +23,32 @@ pub enum Entry {
     },
 }
 
-#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct Snapshot {
     pub generation: Generation,
+    #[serde(default)]
+    pub state_id: String,
     pub entries: BTreeMap<PathBuf, Entry>,
+}
+
+impl Default for Snapshot {
+    fn default() -> Self {
+        let entries = BTreeMap::new();
+        Self {
+            generation: 0,
+            state_id: state_id(&entries).expect("empty snapshot state is serializable"),
+            entries,
+        }
+    }
+}
+
+impl Snapshot {
+    pub fn normalize(mut self) -> Result<Self> {
+        if self.state_id.is_empty() {
+            self.state_id = state_id(&self.entries)?;
+        }
+        Ok(self)
+    }
 }
 
 impl Entry {
@@ -111,6 +133,20 @@ pub fn state_id(entries: &BTreeMap<PathBuf, Entry>) -> Result<String> {
     Ok(blake3::hash(&serde_json::to_vec(entries)?)
         .to_hex()
         .to_string())
+}
+
+pub fn delta_state_id(
+    previous: &str,
+    generation: Generation,
+    changes: &BTreeMap<PathBuf, Option<Entry>>,
+) -> Result<String> {
+    validate_paths(changes.keys())?;
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"devsync-delta-state-v1\0");
+    hasher.update(previous.as_bytes());
+    hasher.update(&generation.to_be_bytes());
+    hasher.update(&serde_json::to_vec(changes)?);
+    Ok(hasher.finalize().to_hex().to_string())
 }
 
 pub fn validate_relative_path(path: &Path) -> Result<()> {

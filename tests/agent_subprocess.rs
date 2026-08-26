@@ -5,7 +5,7 @@ use std::path::PathBuf;
 use std::process::{Command, Stdio};
 
 use devsync::protocol::{Plan, PlanKind};
-use devsync::snapshot::{Entry, state_id};
+use devsync::snapshot::{Entry, delta_state_id, state_id};
 use devsync::transport::{close, connect, transact, transact_connected};
 
 #[test]
@@ -130,17 +130,16 @@ fn one_agent_process_handles_multiple_transactions() {
             executable: false,
         },
     )]);
+    let changes = second_entries
+        .into_iter()
+        .map(|(path, entry)| (path, Some(entry)))
+        .collect();
     let second = Plan {
         expected_generation: 1,
         expected_state_id: remote_state.state_id.clone(),
         generation: 2,
-        state_id: state_id(&second_entries).unwrap(),
-        kind: PlanKind::Delta {
-            changes: second_entries
-                .into_iter()
-                .map(|(path, entry)| (path, Some(entry)))
-                .collect(),
-        },
+        state_id: delta_state_id(&remote_state.state_id, 2, &changes).unwrap(),
+        kind: PlanKind::Delta { changes },
     };
     transact_connected(&mut stdout, &mut stdin, &mut remote_state, &local, |_| {
         Ok(second)

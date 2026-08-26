@@ -6,7 +6,7 @@ use std::process::Command;
 use anyhow::{Context, Result, bail};
 
 use devsync::protocol::{Plan, PlanKind};
-use devsync::snapshot::{Entry, Snapshot, state_id, validate_relative_path};
+use devsync::snapshot::{Entry, Snapshot, delta_state_id, state_id, validate_relative_path};
 use devsync::transport::RemoteState;
 
 pub const RECONCILE_PATHS: [&str; 3] = [".devsyncignore", ".git/info/exclude", ".git/index"];
@@ -33,9 +33,10 @@ impl<'a> Planner<'a> {
         changed: &BTreeSet<PathBuf>,
         remote: &RemoteState,
     ) -> Result<Plan> {
-        let local_state_id = state_id(&self.acknowledged.entries)?;
-        let same_state =
-            remote.generation == self.acknowledged.generation && remote.state_id == local_state_id;
+        let local_state_id = &self.acknowledged.state_id;
+        let same_state = !remote.recovery_required
+            && remote.generation == self.acknowledged.generation
+            && remote.state_id == *local_state_id;
         let mode = if same_state
             && requested == PlanMode::Delta
             && !dirty_is_ambiguous(changed, &self.acknowledged.entries)
@@ -52,9 +53,24 @@ impl<'a> Planner<'a> {
                 changes: dirty_entries(self.root, changed, &self.acknowledged.entries)?,
             },
         };
-        let entries = apply_kind(&self.acknowledged.entries, &kind);
-        let desired_state_id = state_id(&entries)?;
-        if !same_state && desired_state_id == remote.state_id {
+        if matches!(&kind, PlanKind::Delta { changes } if changes.is_empty()) {
+            return Ok(Plan {
+                expected_generation: remote.generation,
+                expected_state_id: remote.state_id.clone(),
+                generation: remote.generation,
+                state_id: remote.state_id.clone(),
+                kind,
+            });
+        }
+        let generation = remote
+            .generation
+            .checked_add(1)
+            .context("remote generation overflow")?;
+        let desired_state_id = match &kind {
+            PlanKind::Full { entries } => state_id(entries)?,
+            PlanKind::Delta { changes } => delta_state_id(local_state_id, generation, changes)?,
+        };
+        if !remote.recovery_required && !same_state && desired_state_id == remote.state_id {
             // The remote already committed this exact tree. Adopt its generation
             // without sending another protocol transaction.
             return Ok(Plan {
@@ -68,21 +84,31 @@ impl<'a> Planner<'a> {
         Ok(Plan {
             expected_generation: remote.generation,
             expected_state_id: remote.state_id.clone(),
-            generation: remote
-                .generation
-                .checked_add(1)
-                .context("remote generation overflow")?,
+            generation,
             state_id: desired_state_id,
             kind,
         })
     }
 }
 
-pub fn committed_snapshot(previous: &Snapshot, plan: &Plan) -> Snapshot {
-    Snapshot {
-        generation: plan.generation,
-        entries: apply_kind(&previous.entries, &plan.kind),
+pub fn commit_snapshot(snapshot: &mut Snapshot, plan: &Plan) {
+    match &plan.kind {
+        PlanKind::Full { entries } => snapshot.entries.clone_from(entries),
+        PlanKind::Delta { changes } => {
+            for (path, entry) in changes {
+                match entry {
+                    Some(entry) => {
+                        snapshot.entries.insert(path.clone(), entry.clone());
+                    }
+                    None => {
+                        snapshot.entries.remove(path);
+                    }
+                }
+            }
+        }
     }
+    snapshot.generation = plan.generation;
+    snapshot.state_id.clone_from(&plan.state_id);
 }
 
 pub fn full_entries(root: &Path) -> Result<BTreeMap<PathBuf, Entry>> {
@@ -106,7 +132,12 @@ pub fn dirty_entries(
         if eligible.contains(&path) {
             let entry = Entry::from_path(&root.join(&path))
                 .with_context(|| format!("scan dirty path {}", path.display()))?;
-            changes.insert(path, Some(entry));
+            if !previous
+                .get(&path)
+                .is_some_and(|previous| previous.content_matches(&entry))
+            {
+                changes.insert(path, Some(entry));
+            }
         } else if previous.contains_key(&path) {
             changes.insert(path, None);
         }
@@ -127,36 +158,15 @@ pub fn needs_reconcile(root: &Path, paths: &BTreeSet<PathBuf>) -> bool {
 
 fn dirty_is_ambiguous(paths: &BTreeSet<PathBuf>, previous: &BTreeMap<PathBuf, Entry>) -> bool {
     paths.iter().any(|path| {
-        (path.is_dir() && !path.is_symlink())
-            || previous
-                .keys()
-                .any(|managed| managed != path && managed.starts_with(path))
-    })
-}
-
-fn apply_kind(previous: &BTreeMap<PathBuf, Entry>, kind: &PlanKind) -> BTreeMap<PathBuf, Entry> {
-    match kind {
-        PlanKind::Full { entries } => entries.clone(),
-        PlanKind::Delta { changes } => apply_changes(previous, changes),
-    }
-}
-
-fn apply_changes(
-    previous: &BTreeMap<PathBuf, Entry>,
-    changes: &BTreeMap<PathBuf, Option<Entry>>,
-) -> BTreeMap<PathBuf, Entry> {
-    let mut entries = previous.clone();
-    for (path, entry) in changes {
-        match entry {
-            Some(entry) => {
-                entries.insert(path.clone(), entry.clone());
-            }
-            None => {
-                entries.remove(path);
-            }
+        if path.is_dir() && !path.is_symlink() {
+            return true;
         }
-    }
-    entries
+        previous
+            .range(path.clone()..)
+            .map(|(managed, _)| managed)
+            .find(|managed| *managed != path)
+            .is_some_and(|managed| managed.starts_with(path))
+    })
 }
 
 fn scan_entries(root: &Path, paths: BTreeSet<PathBuf>) -> Result<BTreeMap<PathBuf, Entry>> {
@@ -331,6 +341,23 @@ mod tests {
     }
 
     #[test]
+    fn unchanged_dirty_path_is_a_noop() {
+        let temp = repo();
+        fs::write(temp.path().join("file"), b"same").unwrap();
+        let previous = BTreeMap::from([(
+            PathBuf::from("file"),
+            Entry::from_path(&temp.path().join("file")).unwrap(),
+        )]);
+        let changed = BTreeSet::from([PathBuf::from("file")]);
+
+        assert!(
+            dirty_entries(temp.path(), &changed, &previous)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
     fn remote_mismatch_forces_full_plan() {
         let temp = repo();
         fs::write(temp.path().join("file"), b"one").unwrap();
@@ -342,11 +369,32 @@ mod tests {
                 &RemoteState {
                     generation: 7,
                     state_id: "other".into(),
+                    recovery_required: false,
                 },
             )
             .unwrap();
         assert!(matches!(plan.kind, PlanKind::Full { .. }));
         assert_eq!(plan.expected_generation, 7);
+    }
+
+    #[test]
+    fn recovery_required_forces_a_full_transaction() {
+        let temp = repo();
+        let acknowledged = Snapshot::default();
+        let plan = Planner::new(temp.path(), &acknowledged)
+            .plan(
+                PlanMode::Delta,
+                &BTreeSet::new(),
+                &RemoteState {
+                    generation: acknowledged.generation,
+                    state_id: acknowledged.state_id.clone(),
+                    recovery_required: true,
+                },
+            )
+            .unwrap();
+
+        assert!(matches!(plan.kind, PlanKind::Full { .. }));
+        assert_eq!(plan.generation, 1);
     }
 
     #[test]

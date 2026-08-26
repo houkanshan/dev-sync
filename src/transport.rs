@@ -5,13 +5,16 @@ use std::path::Path;
 
 use anyhow::{Context, Result, bail};
 
-use crate::protocol::{AgentMessage, ClientMessage, PROTOCOL_VERSION, Plan, read_json, write_json};
+use crate::protocol::{
+    AgentMessage, ClientMessage, PROTOCOL_VERSION, Plan, PlanKind, read_json, write_json,
+};
 use crate::snapshot::{Entry, Generation, validate_relative_path};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RemoteState {
     pub generation: Generation,
     pub state_id: String,
+    pub recovery_required: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -31,9 +34,11 @@ pub fn connect<R: Read, W: Write>(reader: &mut R, writer: &mut W) -> Result<Remo
             version,
             generation,
             state_id,
+            recovery_required,
         }) if version == PROTOCOL_VERSION => Ok(RemoteState {
             generation,
             state_id,
+            recovery_required,
         }),
         Some(AgentMessage::Hello { version, .. }) => {
             bail!("agent protocol version {version} does not match {PROTOCOL_VERSION}")
@@ -63,7 +68,10 @@ where
     F: FnOnce(&RemoteState) -> Result<Plan>,
 {
     let plan = build_plan(remote)?;
-    if remote.generation == plan.generation && remote.state_id == plan.state_id {
+    if !remote.recovery_required
+        && remote.generation == plan.generation
+        && remote.state_id == plan.state_id
+    {
         return Ok(Transaction {
             plan,
             requested: BTreeSet::new(),
@@ -80,11 +88,18 @@ where
     }
 
     write_json(writer, &ClientMessage::Plan(plan.clone()))?;
-    let requested = match read_json(reader)? {
-        Some(AgentMessage::NeedPayloads { paths }) => paths,
-        Some(AgentMessage::Error { message }) => bail!("agent rejected plan: {message}"),
-        Some(message) => bail!("unexpected agent response: {message:?}"),
-        None => bail!("agent closed before requesting payloads"),
+    let requested = match &plan.kind {
+        PlanKind::Full { .. } => match read_json(reader)? {
+            Some(AgentMessage::NeedPayloads { paths }) => paths,
+            Some(AgentMessage::Error { message }) => bail!("agent rejected plan: {message}"),
+            Some(message) => bail!("unexpected agent response: {message:?}"),
+            None => bail!("agent closed before requesting payloads"),
+        },
+        PlanKind::Delta { changes } => changes
+            .iter()
+            .filter(|(_, entry)| matches!(entry, Some(Entry::File { .. })))
+            .map(|(path, _)| path.clone())
+            .collect(),
     };
     let mut unique = BTreeSet::new();
     for path in requested {
@@ -133,6 +148,7 @@ where
             *remote = RemoteState {
                 generation,
                 state_id,
+                recovery_required: false,
             };
             Ok(Transaction {
                 plan,
@@ -237,6 +253,7 @@ mod tests {
                 version: PROTOCOL_VERSION,
                 generation: plan.expected_generation,
                 state_id: plan.expected_state_id.clone(),
+                recovery_required: false,
             },
         )
         .unwrap();
@@ -303,6 +320,7 @@ mod tests {
                 version: PROTOCOL_VERSION,
                 generation: plan.generation,
                 state_id: plan.state_id.clone(),
+                recovery_required: false,
             },
         )
         .unwrap();
