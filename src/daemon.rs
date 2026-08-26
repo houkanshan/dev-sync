@@ -1,8 +1,6 @@
 use std::collections::BTreeSet;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Condvar, Mutex as StdMutex};
-use std::thread::{self, JoinHandle};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
@@ -341,68 +339,6 @@ fn worker_loop(
     Ok(())
 }
 
-struct AgentTimeout {
-    control: Arc<(StdMutex<bool>, Condvar)>,
-    timed_out: Arc<AtomicBool>,
-    thread: Option<JoinHandle<()>>,
-}
-
-impl AgentTimeout {
-    fn start(terminator: deploy::AgentTerminator, timeout: Duration) -> Self {
-        Self::start_with(timeout, move || {
-            let _ = terminator.terminate();
-        })
-    }
-
-    fn start_with(timeout: Duration, terminate: impl FnOnce() + Send + 'static) -> Self {
-        let control = Arc::new((StdMutex::new(false), Condvar::new()));
-        let timed_out = Arc::new(AtomicBool::new(false));
-        let thread_control = Arc::clone(&control);
-        let thread_timed_out = Arc::clone(&timed_out);
-        let thread = thread::spawn(move || {
-            let (canceled, wake) = &*thread_control;
-            let canceled = canceled.lock().expect("agent timeout lock was poisoned");
-            let (canceled, result) = wake
-                .wait_timeout_while(canceled, timeout, |canceled| !*canceled)
-                .expect("agent timeout lock was poisoned");
-            if result.timed_out() && !*canceled {
-                thread_timed_out.store(true, Ordering::Release);
-                terminate();
-            }
-        });
-        Self {
-            control,
-            timed_out,
-            thread: Some(thread),
-        }
-    }
-
-    fn finish(mut self) -> bool {
-        self.cancel();
-        if let Some(thread) = self.thread.take() {
-            let _ = thread.join();
-        }
-        self.timed_out.load(Ordering::Acquire)
-    }
-
-    fn cancel(&self) {
-        let (canceled, wake) = &*self.control;
-        if let Ok(mut canceled) = canceled.lock() {
-            *canceled = true;
-            wake.notify_one();
-        }
-    }
-}
-
-impl Drop for AgentTimeout {
-    fn drop(&mut self) {
-        self.cancel();
-        if let Some(thread) = self.thread.take() {
-            let _ = thread.join();
-        }
-    }
-}
-
 struct AgentSession {
     agent: deploy::AgentChild,
     remote: transport::RemoteState,
@@ -411,7 +347,7 @@ struct AgentSession {
 impl AgentSession {
     fn connect(deployment: &deploy::Deployment) -> Result<Self> {
         let mut agent = deployment.launch()?;
-        let timeout = AgentTimeout::start(agent.terminator(), AGENT_SESSION_TIMEOUT);
+        let timeout = agent.terminator().watchdog(AGENT_SESSION_TIMEOUT);
         let result = transport::connect(&mut agent.stdout, &mut agent.stdin);
         if timeout.finish() {
             let _ = agent.wait();
@@ -441,7 +377,7 @@ impl AgentSession {
         } else {
             AGENT_SESSION_TIMEOUT
         };
-        let timeout = AgentTimeout::start(self.agent.terminator(), transaction_timeout);
+        let timeout = self.agent.terminator().watchdog(transaction_timeout);
         let result = transport::transact_plan_connected(
             &mut self.agent.stdout,
             &mut self.agent.stdin,
@@ -459,7 +395,7 @@ impl AgentSession {
     }
 
     fn close(mut self) -> Result<()> {
-        let timeout = AgentTimeout::start(self.agent.terminator(), AGENT_SESSION_TIMEOUT);
+        let timeout = self.agent.terminator().watchdog(AGENT_SESSION_TIMEOUT);
         let close = transport::close(&mut self.agent.stdin);
         let wait = self.agent.wait();
         if timeout.finish() {
@@ -614,26 +550,6 @@ impl Drop for SocketGuard {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn agent_timeout_can_be_canceled_or_fire() {
-        let canceled_fired = Arc::new(AtomicBool::new(false));
-        let fired = Arc::clone(&canceled_fired);
-        let timeout = AgentTimeout::start_with(Duration::from_secs(1), move || {
-            fired.store(true, Ordering::Release);
-        });
-        assert!(!timeout.finish());
-        assert!(!canceled_fired.load(Ordering::Acquire));
-
-        let elapsed_fired = Arc::new(AtomicBool::new(false));
-        let fired = Arc::clone(&elapsed_fired);
-        let timeout = AgentTimeout::start_with(Duration::from_millis(5), move || {
-            fired.store(true, Ordering::Release);
-        });
-        thread::sleep(Duration::from_millis(20));
-        assert!(timeout.finish());
-        assert!(elapsed_fired.load(Ordering::Acquire));
-    }
 
     #[test]
     fn formats_all_changed_paths_under_limit() {

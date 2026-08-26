@@ -2,8 +2,9 @@ use std::fs;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command, Stdio};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, mpsc};
 use std::thread::{self, JoinHandle};
+use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, bail};
 
@@ -108,6 +109,49 @@ impl AgentTerminator {
             child.kill().context("terminate remote agent")?;
         }
         Ok(())
+    }
+
+    pub fn watchdog(&self, timeout: Duration) -> AgentWatchdog {
+        let terminator = self.clone();
+        let (cancel, canceled) = mpsc::channel();
+        let thread = thread::spawn(move || match canceled.recv_timeout(timeout) {
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                let _ = terminator.terminate();
+                true
+            }
+            Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected) => false,
+        });
+        AgentWatchdog {
+            cancel: Some(cancel),
+            thread: Some(thread),
+        }
+    }
+}
+
+pub struct AgentWatchdog {
+    cancel: Option<mpsc::Sender<()>>,
+    thread: Option<JoinHandle<bool>>,
+}
+
+impl AgentWatchdog {
+    pub fn finish(mut self) -> bool {
+        self.stop()
+    }
+
+    fn stop(&mut self) -> bool {
+        if let Some(cancel) = self.cancel.take() {
+            let _ = cancel.send(());
+        }
+        self.thread
+            .take()
+            .and_then(|thread| thread.join().ok())
+            .unwrap_or(false)
+    }
+}
+
+impl Drop for AgentWatchdog {
+    fn drop(&mut self) {
+        self.stop();
     }
 }
 
@@ -381,6 +425,10 @@ mod tests {
             .unwrap();
         let agent = AgentChild::from_child(child).unwrap();
         let started = std::time::Instant::now();
+        let watchdog = agent
+            .terminator()
+            .watchdog(std::time::Duration::from_secs(30));
+        assert!(!watchdog.finish());
 
         agent.terminator().terminate().unwrap();
         assert!(agent.wait().is_err());
