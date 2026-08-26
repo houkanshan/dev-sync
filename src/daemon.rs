@@ -21,7 +21,8 @@ use crate::project::{Project, load_snapshot, save_snapshot};
 use crate::sync::{self, PlanMode};
 
 const MAX_LOGGED_PATHS: usize = 20;
-const AGENT_TRANSACTION_TIMEOUT: Duration = Duration::from_secs(60);
+const AGENT_SESSION_TIMEOUT: Duration = Duration::from_secs(60);
+const AGENT_FULL_TRANSACTION_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 
 fn log(message: impl std::fmt::Display) {
     eprintln!(
@@ -407,13 +408,13 @@ struct AgentSession {
 impl AgentSession {
     fn connect(deployment: &deploy::Deployment) -> Result<Self> {
         let mut agent = deployment.launch()?;
-        let timeout = AgentTimeout::start(agent.terminator(), AGENT_TRANSACTION_TIMEOUT);
+        let timeout = AgentTimeout::start(agent.terminator(), AGENT_SESSION_TIMEOUT);
         let result = transport::connect(&mut agent.stdout, &mut agent.stdin);
         if timeout.finish() {
             let _ = agent.wait();
             bail!(
                 "remote agent handshake timed out after {}s",
-                AGENT_TRANSACTION_TIMEOUT.as_secs()
+                AGENT_SESSION_TIMEOUT.as_secs()
             );
         }
         match result {
@@ -431,7 +432,13 @@ impl AgentSession {
         project: &Project,
         plan: devsync::protocol::Plan,
     ) -> Result<transport::Transaction> {
-        let timeout = AgentTimeout::start(self.agent.terminator(), AGENT_TRANSACTION_TIMEOUT);
+        let transaction_timeout = if matches!(&plan.kind, devsync::protocol::PlanKind::Full { .. })
+        {
+            AGENT_FULL_TRANSACTION_TIMEOUT
+        } else {
+            AGENT_SESSION_TIMEOUT
+        };
+        let timeout = AgentTimeout::start(self.agent.terminator(), transaction_timeout);
         let result = transport::transact_plan_connected(
             &mut self.agent.stdout,
             &mut self.agent.stdin,
@@ -442,20 +449,20 @@ impl AgentSession {
         if timeout.finish() {
             bail!(
                 "remote agent transaction timed out after {}s",
-                AGENT_TRANSACTION_TIMEOUT.as_secs()
+                transaction_timeout.as_secs()
             );
         }
         result
     }
 
     fn close(mut self) -> Result<()> {
-        let timeout = AgentTimeout::start(self.agent.terminator(), AGENT_TRANSACTION_TIMEOUT);
+        let timeout = AgentTimeout::start(self.agent.terminator(), AGENT_SESSION_TIMEOUT);
         let close = transport::close(&mut self.agent.stdin);
         let wait = self.agent.wait();
         if timeout.finish() {
             bail!(
                 "remote agent shutdown timed out after {}s",
-                AGENT_TRANSACTION_TIMEOUT.as_secs()
+                AGENT_SESSION_TIMEOUT.as_secs()
             );
         }
         match (close, wait) {
