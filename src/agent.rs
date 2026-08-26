@@ -162,8 +162,7 @@ fn transact_plan<R: Read, W: Write>(
     };
 
     let intent = intent_paths(snapshot, recovery_paths, &plan.kind);
-    append_journal(state_path, &intent)?;
-    recovery_paths.extend(intent.iter().cloned());
+    record_intent(state_path, &intent, recovery_paths)?;
     apply(root, stage.path(), snapshot, recovery_paths, &plan.kind)?;
     sync_applied_paths(root, &intent)?;
     commit_snapshot(snapshot, &plan);
@@ -600,6 +599,20 @@ fn truncate_journal_tail(file: &fs::File, length: u64) -> Result<()> {
     Ok(())
 }
 
+fn record_intent(
+    state_path: &Path,
+    intent: &BTreeSet<PathBuf>,
+    recovery_paths: &mut BTreeSet<PathBuf>,
+) -> Result<()> {
+    let unrecorded = intent
+        .difference(recovery_paths)
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    append_journal(state_path, &unrecorded)?;
+    recovery_paths.extend(unrecorded);
+    Ok(())
+}
+
 fn append_journal(state_path: &Path, paths: &BTreeSet<PathBuf>) -> Result<()> {
     if paths.is_empty() {
         return Ok(());
@@ -785,6 +798,23 @@ mod tests {
         assert!(!root.join("link").exists());
         assert_eq!(load_snapshot(&state).unwrap().generation, 2);
         assert_eq!(fs::read(root.join("unmanaged")).unwrap(), b"keep me");
+    }
+
+    #[test]
+    fn repeated_intent_is_journaled_once() {
+        let temp = tempfile::tempdir().unwrap();
+        let state = temp.path().join("state/snapshot.json");
+        save_snapshot(&state, &Snapshot::default()).unwrap();
+        let intent = BTreeSet::from([PathBuf::from("same")]);
+        let mut recovery_paths = BTreeSet::new();
+        record_intent(&state, &intent, &mut recovery_paths).unwrap();
+        let journal = journal_path(&state);
+        let first_length = fs::metadata(&journal).unwrap().len();
+
+        record_intent(&state, &intent, &mut recovery_paths).unwrap();
+
+        assert_eq!(fs::metadata(journal).unwrap().len(), first_length);
+        assert_eq!(recovery_paths, intent);
     }
 
     #[test]
