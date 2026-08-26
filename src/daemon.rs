@@ -201,6 +201,7 @@ fn worker_loop(
 ) -> Result<()> {
     let runtime = tokio::runtime::Handle::current();
     let mut acknowledged = load_snapshot(&project.snapshot_path)?;
+    let mut session = None;
     let mut force_full = true;
     while let Some(first) = work_rx.blocking_recv() {
         let mut changed = BTreeSet::new();
@@ -236,12 +237,19 @@ fn worker_loop(
             "delta"
         };
         let sync_started = Instant::now();
-        let result =
-            sync_once(&project, &deployment, &acknowledged, mode, &changed).and_then(|outcome| {
-                let next = sync::committed_snapshot(&acknowledged, &outcome.plan);
-                save_snapshot(&project.snapshot_path, &next)?;
-                Ok((outcome, next))
-            });
+        let result = sync_once(
+            &project,
+            &deployment,
+            &mut session,
+            &acknowledged,
+            mode,
+            &changed,
+        )
+        .and_then(|outcome| {
+            let next = sync::committed_snapshot(&acknowledged, &outcome.plan);
+            save_snapshot(&project.snapshot_path, &next)?;
+            Ok((outcome, next))
+        });
         match &result {
             Ok((outcome, _)) => {
                 let elapsed = sync_started.elapsed().as_millis();
@@ -301,29 +309,80 @@ fn worker_loop(
             break;
         }
     }
+    if let Some(session) = session
+        && let Err(error) = session.close()
+    {
+        log(format!("close remote agent failed: {error:#}"));
+    }
     Ok(())
+}
+
+struct AgentSession {
+    agent: deploy::AgentChild,
+    remote: transport::RemoteState,
+}
+
+impl AgentSession {
+    fn connect(deployment: &deploy::Deployment) -> Result<Self> {
+        let mut agent = deployment.launch()?;
+        match transport::connect(&mut agent.stdout, &mut agent.stdin) {
+            Ok(remote) => Ok(Self { agent, remote }),
+            Err(error) => {
+                let _ = agent.wait();
+                Err(error)
+            }
+        }
+    }
+
+    fn transact(
+        &mut self,
+        project: &Project,
+        acknowledged: &devsync::snapshot::Snapshot,
+        mode: PlanMode,
+        changed: &BTreeSet<PathBuf>,
+    ) -> Result<transport::Transaction> {
+        transport::transact_connected(
+            &mut self.agent.stdout,
+            &mut self.agent.stdin,
+            &mut self.remote,
+            &project.root,
+            |remote| sync::Planner::new(&project.root, acknowledged).plan(mode, changed, remote),
+        )
+    }
+
+    fn close(mut self) -> Result<()> {
+        let close = transport::close(&mut self.agent.stdin);
+        let wait = self.agent.wait();
+        match (close, wait) {
+            (Ok(()), Ok(())) => Ok(()),
+            (Err(error), _) | (Ok(()), Err(error)) => Err(error),
+        }
+    }
+
+    fn abort(self) {
+        let _ = self.agent.wait();
+    }
 }
 
 fn sync_once(
     project: &Project,
     deployment: &deploy::Deployment,
+    session: &mut Option<AgentSession>,
     acknowledged: &devsync::snapshot::Snapshot,
     mode: PlanMode,
     changed: &BTreeSet<PathBuf>,
 ) -> Result<transport::Transaction> {
-    let mut agent = deployment.launch()?;
-    let result = transport::transact(
-        &mut agent.stdout,
-        &mut agent.stdin,
-        &project.root,
-        |remote| sync::Planner::new(&project.root, acknowledged).plan(mode, changed, remote),
-    );
-    let wait = agent.wait();
-    match (result, wait) {
-        (Ok(outcome), Ok(())) => Ok(outcome),
-        (Err(error), _) => Err(error),
-        (Ok(_), Err(error)) => Err(error),
+    if session.is_none() {
+        *session = Some(AgentSession::connect(deployment)?);
     }
+    let result = session
+        .as_mut()
+        .expect("agent session was initialized")
+        .transact(project, acknowledged, mode, changed);
+    if result.is_err() {
+        session.take().expect("failed agent session exists").abort();
+    }
+    result
 }
 
 fn work_mode(

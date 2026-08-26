@@ -19,11 +19,41 @@ pub struct Transaction {
     pub plan: Plan,
     pub requested: BTreeSet<std::path::PathBuf>,
 }
-/// Runs one plan over a connected agent transport. The plan is built only after
-/// the remote identity is known, so callers can safely fall back to a full plan.
-pub fn transact<R, W, F>(
+pub fn connect<R: Read, W: Write>(reader: &mut R, writer: &mut W) -> Result<RemoteState> {
+    write_json(
+        writer,
+        &ClientMessage::Hello {
+            version: PROTOCOL_VERSION,
+        },
+    )?;
+    match read_json(reader)? {
+        Some(AgentMessage::Hello {
+            version,
+            generation,
+            state_id,
+        }) if version == PROTOCOL_VERSION => Ok(RemoteState {
+            generation,
+            state_id,
+        }),
+        Some(AgentMessage::Hello { version, .. }) => {
+            bail!("agent protocol version {version} does not match {PROTOCOL_VERSION}")
+        }
+        Some(AgentMessage::Error { message }) => bail!("agent handshake failed: {message}"),
+        Some(message) => bail!("unexpected agent handshake response: {message:?}"),
+        None => bail!("agent closed during handshake"),
+    }
+}
+
+pub fn close<W: Write>(writer: &mut W) -> Result<()> {
+    write_json(writer, &ClientMessage::Complete)
+}
+
+/// Runs one plan over an already-handshaken agent session and advances its
+/// observed remote state after an acknowledgement.
+pub fn transact_connected<R, W, F>(
     reader: &mut R,
     writer: &mut W,
+    remote: &mut RemoteState,
     local_root: &Path,
     build_plan: F,
 ) -> Result<Transaction>
@@ -32,33 +62,8 @@ where
     W: Write,
     F: FnOnce(&RemoteState) -> Result<Plan>,
 {
-    write_json(
-        writer,
-        &ClientMessage::Hello {
-            version: PROTOCOL_VERSION,
-        },
-    )?;
-    let remote = match read_json(reader)? {
-        Some(AgentMessage::Hello {
-            version,
-            generation,
-            state_id,
-        }) if version == PROTOCOL_VERSION => RemoteState {
-            generation,
-            state_id,
-        },
-        Some(AgentMessage::Hello { version, .. }) => {
-            bail!("agent protocol version {version} does not match {PROTOCOL_VERSION}")
-        }
-        Some(AgentMessage::Error { message }) => bail!("agent handshake failed: {message}"),
-        Some(message) => bail!("unexpected agent handshake response: {message:?}"),
-        None => bail!("agent closed during handshake"),
-    };
-    let plan = build_plan(&remote)?;
+    let plan = build_plan(remote)?;
     if remote.generation == plan.generation && remote.state_id == plan.state_id {
-        // The prior transaction committed but its ACK was lost. Tell the agent
-        // that no plan is needed so it can exit cleanly instead of waiting for Plan.
-        write_json(writer, &ClientMessage::Complete)?;
         return Ok(Transaction {
             plan,
             requested: BTreeSet::new(),
@@ -66,7 +71,7 @@ where
     }
     if remote.generation != plan.expected_generation || remote.state_id != plan.expected_state_id {
         bail!(
-            "plan expected generation {} state {}, handshake found generation {} state {}",
+            "plan expected generation {} state {}, session has generation {} state {}",
             plan.expected_generation,
             plan.expected_state_id,
             remote.generation,
@@ -124,10 +129,16 @@ where
         Some(AgentMessage::Ack {
             generation,
             state_id,
-        }) if generation == plan.generation && state_id == plan.state_id => Ok(Transaction {
-            plan,
-            requested: unique,
-        }),
+        }) if generation == plan.generation && state_id == plan.state_id => {
+            *remote = RemoteState {
+                generation,
+                state_id,
+            };
+            Ok(Transaction {
+                plan,
+                requested: unique,
+            })
+        }
         Some(AgentMessage::Ack {
             generation,
             state_id,
@@ -140,6 +151,25 @@ where
         Some(message) => bail!("unexpected agent response: {message:?}"),
         None => bail!("agent closed before acknowledging plan"),
     }
+}
+
+/// Runs one transaction and closes the agent session. This remains useful for
+/// subprocess clients; the daemon uses `connect` and `transact_connected`.
+pub fn transact<R, W, F>(
+    reader: &mut R,
+    writer: &mut W,
+    local_root: &Path,
+    build_plan: F,
+) -> Result<Transaction>
+where
+    R: Read,
+    W: Write,
+    F: FnOnce(&RemoteState) -> Result<Plan>,
+{
+    let mut remote = connect(reader, writer)?;
+    let transaction = transact_connected(reader, writer, &mut remote, local_root, build_plan)?;
+    close(writer)?;
+    Ok(transaction)
 }
 
 fn stream_verified<W: Write>(

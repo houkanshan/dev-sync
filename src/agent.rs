@@ -1,5 +1,5 @@
 use std::collections::BTreeSet;
-use std::fs;
+use std::fs::{self, OpenOptions};
 use std::io::{Read, Write};
 use std::os::unix::fs::{PermissionsExt, symlink};
 use std::path::{Path, PathBuf};
@@ -36,7 +36,8 @@ fn serve_session<R: Read, W: Write>(
     output: &mut W,
 ) -> Result<()> {
     fs::create_dir_all(root).with_context(|| format!("create target root {}", root.display()))?;
-    let snapshot = load_snapshot(state_path)?;
+    let _state_lock = acquire_state_lock(state_path)?;
+    let mut snapshot = load_snapshot(state_path)?;
     let snapshot_state_id = state_id(&snapshot.entries)?;
     let Some(ClientMessage::Hello { version }) = read_json(input)? else {
         bail!("expected hello as first protocol message");
@@ -49,19 +50,31 @@ fn serve_session<R: Read, W: Write>(
         &AgentMessage::Hello {
             version: PROTOCOL_VERSION,
             generation: snapshot.generation,
-            state_id: snapshot_state_id.clone(),
+            state_id: snapshot_state_id,
         },
     )?;
-    let Some(message) = read_json(input)? else {
-        bail!("expected plan or completion after hello");
-    };
-    let ClientMessage::Plan(plan) = message else {
-        if matches!(message, ClientMessage::Complete) {
-            return Ok(());
+
+    loop {
+        match read_json(input)? {
+            Some(ClientMessage::Plan(plan)) => {
+                snapshot = transact_plan(root, state_path, input, output, &snapshot, plan)?;
+            }
+            Some(ClientMessage::Complete) | None => return Ok(()),
+            Some(message) => bail!("expected plan or completion, received {message:?}"),
         }
-        bail!("expected plan or completion after hello");
-    };
-    let (desired, desired_state_id) = desired_snapshot(&snapshot, &snapshot_state_id, &plan)?;
+    }
+}
+
+fn transact_plan<R: Read, W: Write>(
+    root: &Path,
+    state_path: &Path,
+    input: &mut R,
+    output: &mut W,
+    snapshot: &Snapshot,
+    plan: Plan,
+) -> Result<Snapshot> {
+    let snapshot_state_id = state_id(&snapshot.entries)?;
+    let (desired, desired_state_id) = desired_snapshot(snapshot, &snapshot_state_id, &plan)?;
     let candidates = match &plan.kind {
         PlanKind::Full { entries } => entries
             .iter()
@@ -110,7 +123,7 @@ fn serve_session<R: Read, W: Write>(
 
     // Application is intentionally per-path. If it is interrupted, the persisted
     // generation is unchanged and the next client must recover with full reconciliation.
-    apply(root, stage.path(), &snapshot, &desired, &plan.kind)?;
+    apply(root, stage.path(), snapshot, &desired, &plan.kind)?;
     save_snapshot(state_path, &desired)?;
     write_json(
         output,
@@ -119,7 +132,29 @@ fn serve_session<R: Read, W: Write>(
             state_id: desired_state_id,
         },
     )?;
-    Ok(())
+    Ok(desired)
+}
+
+fn acquire_state_lock(state_path: &Path) -> Result<fs::File> {
+    let parent = state_path.parent().context("state path has no parent")?;
+    fs::create_dir_all(parent)?;
+    let mut lock_name = state_path.as_os_str().to_os_string();
+    lock_name.push(".lock");
+    let lock_path = PathBuf::from(lock_name);
+    let lock = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(&lock_path)
+        .with_context(|| format!("open agent state lock {}", lock_path.display()))?;
+    lock.try_lock().with_context(|| {
+        format!(
+            "lock agent state {}; another devsync session is active",
+            lock_path.display()
+        )
+    })?;
+    Ok(lock)
 }
 
 fn desired_snapshot(
@@ -404,6 +439,16 @@ mod tests {
             executable,
             modified_ns: 0,
         }
+    }
+
+    #[test]
+    fn state_lock_rejects_a_second_active_agent() {
+        let temp = tempfile::tempdir().unwrap();
+        let state = temp.path().join("state/snapshot.json");
+        let first = acquire_state_lock(&state).unwrap();
+        assert!(acquire_state_lock(&state).is_err());
+        drop(first);
+        acquire_state_lock(&state).unwrap();
     }
 
     #[test]

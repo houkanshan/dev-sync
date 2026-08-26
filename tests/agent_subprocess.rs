@@ -6,7 +6,7 @@ use std::process::{Command, Stdio};
 
 use devsync::protocol::{Plan, PlanKind};
 use devsync::snapshot::{Entry, state_id};
-use devsync::transport::transact;
+use devsync::transport::{close, connect, transact, transact_connected};
 
 #[test]
 fn local_agent_subprocess_requests_and_applies_whole_file() {
@@ -71,6 +71,93 @@ fn local_agent_subprocess_requests_and_applies_whole_file() {
             & 0o111,
         0
     );
+}
+
+#[test]
+fn one_agent_process_handles_multiple_transactions() {
+    let temp = tempfile::tempdir().unwrap();
+    let local = temp.path().join("local");
+    let remote = temp.path().join("remote");
+    let state = temp.path().join("state/snapshot.json");
+    fs::create_dir_all(&local).unwrap();
+    fs::write(local.join("file"), b"one").unwrap();
+
+    let first_entries = BTreeMap::from([(
+        PathBuf::from("file"),
+        Entry::File {
+            digest: blake3::hash(b"one").to_hex().to_string(),
+            size: 3,
+            modified_ns: 0,
+            executable: false,
+        },
+    )]);
+    let first = Plan {
+        expected_generation: 0,
+        expected_state_id: state_id(&BTreeMap::new()).unwrap(),
+        generation: 1,
+        state_id: state_id(&first_entries).unwrap(),
+        kind: PlanKind::Full {
+            entries: first_entries,
+        },
+    };
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_devsync-agent"))
+        .arg("--root")
+        .arg(&remote)
+        .arg("--state")
+        .arg(&state)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut stdin = child.stdin.take().unwrap();
+    let mut stdout = child.stdout.take().unwrap();
+    let mut remote_state = connect(&mut stdout, &mut stdin).unwrap();
+    transact_connected(&mut stdout, &mut stdin, &mut remote_state, &local, |_| {
+        Ok(first)
+    })
+    .unwrap();
+    assert!(child.try_wait().unwrap().is_none());
+
+    fs::write(local.join("file"), b"two").unwrap();
+    let second_entries = BTreeMap::from([(
+        PathBuf::from("file"),
+        Entry::File {
+            digest: blake3::hash(b"two").to_hex().to_string(),
+            size: 3,
+            modified_ns: 0,
+            executable: false,
+        },
+    )]);
+    let second = Plan {
+        expected_generation: 1,
+        expected_state_id: remote_state.state_id.clone(),
+        generation: 2,
+        state_id: state_id(&second_entries).unwrap(),
+        kind: PlanKind::Delta {
+            changes: second_entries
+                .into_iter()
+                .map(|(path, entry)| (path, Some(entry)))
+                .collect(),
+        },
+    };
+    transact_connected(&mut stdout, &mut stdin, &mut remote_state, &local, |_| {
+        Ok(second)
+    })
+    .unwrap();
+    assert_eq!(remote_state.generation, 2);
+    assert!(child.try_wait().unwrap().is_none());
+
+    close(&mut stdin).unwrap();
+    drop(stdin);
+    let output = child.wait_with_output().unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(fs::read(remote.join("file")).unwrap(), b"two");
 }
 
 #[test]
