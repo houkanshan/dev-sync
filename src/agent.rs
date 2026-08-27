@@ -110,27 +110,34 @@ fn transact_plan<R: Read, W: Write>(
     plan: Plan,
 ) -> Result<bool> {
     validate_plan(snapshot, recovery_required, &plan)?;
-    let needed = match &plan.kind {
+    let (needed, changed) = match &plan.kind {
         PlanKind::Full { entries } => {
-            let candidates = entries
-                .iter()
-                .filter(|(_, entry)| entry.needs_payload())
-                .map(|(path, entry)| (path.clone(), entry.clone()))
-                .collect();
-            let needed = needed_payloads(root, &candidates)?;
+            let removals = full_removals(snapshot, recovery_paths, entries);
+            let mut diff = full_diff(root, entries)?;
+            for (path, entry) in entries {
+                if overlaps_any(path, &removals) {
+                    diff.changed.insert(path.clone());
+                    if entry.needs_payload() {
+                        diff.needed.insert(path.clone());
+                    }
+                }
+            }
             write_json(
                 &mut *output,
                 &AgentMessage::NeedPayloads {
-                    paths: needed.iter().cloned().collect(),
+                    paths: diff.needed.iter().cloned().collect(),
                 },
             )?;
-            needed
+            (diff.needed, diff.changed)
         }
-        PlanKind::Delta { changes } => changes
-            .iter()
-            .filter(|(_, entry)| matches!(entry, Some(Entry::File { .. })))
-            .map(|(path, _)| path.clone())
-            .collect(),
+        PlanKind::Delta { changes } => (
+            changes
+                .iter()
+                .filter(|(_, entry)| matches!(entry, Some(Entry::File { .. })))
+                .map(|(path, _)| path.clone())
+                .collect(),
+            changes.keys().cloned().collect(),
+        ),
     };
 
     let stage = tempfile::Builder::new()
@@ -161,9 +168,16 @@ fn transact_plan<R: Read, W: Write>(
         bail!("expected payload completion message");
     };
 
-    let intent = intent_paths(snapshot, recovery_paths, &plan.kind);
+    let intent = intent_paths(snapshot, recovery_paths, &plan.kind, &changed);
     record_intent(state_path, &intent, recovery_paths)?;
-    apply(root, stage.path(), snapshot, recovery_paths, &plan.kind)?;
+    apply(
+        root,
+        stage.path(),
+        snapshot,
+        recovery_paths,
+        &plan.kind,
+        &intent,
+    )?;
     sync_applied_paths(root, &intent)?;
     commit_snapshot(snapshot, &plan);
     let reconciled = matches!(plan.kind, PlanKind::Full { .. });
@@ -206,16 +220,18 @@ fn intent_paths(
     snapshot: &Snapshot,
     recovery_paths: &BTreeSet<PathBuf>,
     kind: &PlanKind,
+    changed: &BTreeSet<PathBuf>,
 ) -> BTreeSet<PathBuf> {
     match kind {
         PlanKind::Full { entries } => snapshot
             .entries
             .keys()
+            .filter(|path| !entries.contains_key(*path))
             .chain(recovery_paths)
-            .chain(entries.keys())
+            .chain(changed)
             .cloned()
             .collect(),
-        PlanKind::Delta { changes } => changes.keys().cloned().collect(),
+        PlanKind::Delta { .. } => changed.clone(),
     }
 }
 
@@ -324,25 +340,58 @@ fn commit_snapshot(snapshot: &mut Snapshot, plan: &Plan) {
     snapshot.state_id.clone_from(&plan.state_id);
 }
 
-fn needed_payloads(
+struct FullDiff {
+    needed: BTreeSet<PathBuf>,
+    changed: BTreeSet<PathBuf>,
+}
+
+fn full_removals(
+    snapshot: &Snapshot,
+    recovery_paths: &BTreeSet<PathBuf>,
+    entries: &std::collections::BTreeMap<PathBuf, Entry>,
+) -> BTreeSet<PathBuf> {
+    snapshot
+        .entries
+        .keys()
+        .chain(recovery_paths)
+        .filter(|path| !entries.contains_key(*path))
+        .cloned()
+        .collect()
+}
+
+fn overlaps_any(path: &Path, candidates: &BTreeSet<PathBuf>) -> bool {
+    path.ancestors()
+        .any(|ancestor| candidates.contains(ancestor))
+        || candidates
+            .range(path.to_path_buf()..)
+            .next()
+            .is_some_and(|candidate| candidate.starts_with(path))
+}
+
+fn full_diff(
     root: &Path,
-    candidates: &std::collections::BTreeMap<PathBuf, Entry>,
-) -> Result<BTreeSet<PathBuf>> {
+    entries: &std::collections::BTreeMap<PathBuf, Entry>,
+) -> Result<FullDiff> {
     let mut needed = BTreeSet::new();
-    for (path, entry) in candidates {
-        if !entry.needs_payload() {
-            continue;
-        }
+    let mut changed = BTreeSet::new();
+    for (path, entry) in entries {
         let actual = if has_safe_real_parents(root, path)? {
             Entry::from_path(&root.join(path)).ok()
         } else {
             None
         };
-        if !actual.is_some_and(|actual| entry.payload_matches(&actual)) {
+        if entry.needs_payload()
+            && !actual
+                .as_ref()
+                .is_some_and(|actual| entry.payload_matches(actual))
+        {
             needed.insert(path.clone());
         }
+        if !actual.is_some_and(|actual| entry.content_matches(&actual)) {
+            changed.insert(path.clone());
+        }
     }
-    Ok(needed)
+    Ok(FullDiff { needed, changed })
 }
 
 fn has_safe_real_parents(root: &Path, relative: &Path) -> Result<bool> {
@@ -408,18 +457,17 @@ fn apply(
     previous: &Snapshot,
     recovery_paths: &BTreeSet<PathBuf>,
     kind: &PlanKind,
+    intent: &BTreeSet<PathBuf>,
 ) -> Result<()> {
     match kind {
         PlanKind::Full { entries } => {
-            let removals = previous
-                .entries
-                .keys()
-                .chain(recovery_paths)
-                .filter(|path| !entries.contains_key(*path))
-                .cloned()
-                .collect::<BTreeSet<_>>();
+            let removals = full_removals(previous, recovery_paths, entries);
             apply_removals(root, &removals)?;
-            apply_entries(root, stage, entries.iter())
+            apply_entries(
+                root,
+                stage,
+                entries.iter().filter(|(path, _)| intent.contains(*path)),
+            )
         }
         PlanKind::Delta { changes } => {
             let removals = changes
@@ -435,6 +483,9 @@ fn apply(
 }
 
 fn sync_applied_paths(root: &Path, paths: &BTreeSet<PathBuf>) -> Result<()> {
+    if paths.is_empty() {
+        return Ok(());
+    }
     let mut directories = BTreeSet::from([root.to_path_buf()]);
     for path in paths {
         let destination = root.join(path);
@@ -733,7 +784,7 @@ mod tests {
         };
 
         assert_eq!(
-            intent_paths(&snapshot, &BTreeSet::new(), &kind),
+            intent_paths(&snapshot, &BTreeSet::new(), &kind, &BTreeSet::new()),
             BTreeSet::from([PathBuf::from("removed")])
         );
     }
@@ -798,6 +849,70 @@ mod tests {
         assert!(!root.join("link").exists());
         assert_eq!(load_snapshot(&state).unwrap().generation, 2);
         assert_eq!(fs::read(root.join("unmanaged")).unwrap(), b"keep me");
+    }
+
+    #[test]
+    fn full_replaces_stale_file_ancestor_with_desired_child() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("root");
+        let state = temp.path().join("state/snapshot.json");
+        fs::create_dir_all(root.join("path")).unwrap();
+        fs::write(root.join("path/child"), b"desired").unwrap();
+
+        let previous_entries = BTreeMap::from([(PathBuf::from("path"), entry(b"previous", false))]);
+        let previous = Snapshot {
+            generation: 1,
+            state_id: state_id(&previous_entries).unwrap(),
+            entries: previous_entries,
+        };
+        save_snapshot(&state, &previous).unwrap();
+        let desired = BTreeMap::from([(PathBuf::from("path/child"), entry(b"desired", false))]);
+        let plan = Plan {
+            expected_generation: previous.generation,
+            expected_state_id: previous.state_id,
+            generation: 2,
+            state_id: state_id(&desired).unwrap(),
+            kind: PlanKind::Full { entries: desired },
+        };
+
+        transact(
+            &root,
+            &state,
+            plan,
+            &[(PathBuf::from("path/child"), b"desired")],
+        );
+
+        assert_eq!(fs::read(root.join("path/child")).unwrap(), b"desired");
+    }
+
+    #[test]
+    fn full_replaces_stale_child_with_desired_file_ancestor() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("root");
+        let state = temp.path().join("state/snapshot.json");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("path"), b"desired").unwrap();
+
+        let previous_entries =
+            BTreeMap::from([(PathBuf::from("path/child"), entry(b"previous", false))]);
+        let previous = Snapshot {
+            generation: 1,
+            state_id: state_id(&previous_entries).unwrap(),
+            entries: previous_entries,
+        };
+        save_snapshot(&state, &previous).unwrap();
+        let desired = BTreeMap::from([(PathBuf::from("path"), entry(b"desired", false))]);
+        let plan = Plan {
+            expected_generation: previous.generation,
+            expected_state_id: previous.state_id,
+            generation: 2,
+            state_id: state_id(&desired).unwrap(),
+            kind: PlanKind::Full { entries: desired },
+        };
+
+        transact(&root, &state, plan, &[(PathBuf::from("path"), b"desired")]);
+
+        assert_eq!(fs::read(root.join("path")).unwrap(), b"desired");
     }
 
     #[test]
@@ -912,7 +1027,15 @@ mod tests {
             changes: BTreeMap::from([(PathBuf::from("changed"), Some(changed_entry))]),
         };
 
-        apply(&root, &stage, &previous, &BTreeSet::new(), &kind).unwrap();
+        apply(
+            &root,
+            &stage,
+            &previous,
+            &BTreeSet::new(),
+            &kind,
+            &BTreeSet::from([PathBuf::from("changed")]),
+        )
+        .unwrap();
 
         assert_ne!(
             fs::metadata(root.join("changed"))
@@ -940,10 +1063,9 @@ mod tests {
         symlink(&outside, root.join("parent")).unwrap();
         let candidates =
             BTreeMap::from([(PathBuf::from("parent/file"), entry(b"matching", false))]);
-        assert_eq!(
-            needed_payloads(&root, &candidates).unwrap(),
-            BTreeSet::from([PathBuf::from("parent/file")])
-        );
+        let diff = full_diff(&root, &candidates).unwrap();
+        assert_eq!(diff.needed, BTreeSet::from([PathBuf::from("parent/file")]));
+        assert_eq!(diff.changed, diff.needed);
     }
 
     #[test]
@@ -953,7 +1075,9 @@ mod tests {
         fs::create_dir_all(&root).unwrap();
         fs::write(root.join("file"), b"matching").unwrap();
         let candidates = BTreeMap::from([(PathBuf::from("file"), entry(b"matching", false))]);
-        assert!(needed_payloads(&root, &candidates).unwrap().is_empty());
+        let diff = full_diff(&root, &candidates).unwrap();
+        assert!(diff.needed.is_empty());
+        assert!(diff.changed.is_empty());
     }
 
     #[test]
@@ -963,7 +1087,9 @@ mod tests {
         fs::create_dir_all(&root).unwrap();
         fs::write(root.join("file"), b"matching").unwrap();
         let candidates = BTreeMap::from([(PathBuf::from("file"), entry(b"matching", true))]);
-        assert!(needed_payloads(&root, &candidates).unwrap().is_empty());
+        let diff = full_diff(&root, &candidates).unwrap();
+        assert!(diff.needed.is_empty());
+        assert_eq!(diff.changed, BTreeSet::from([PathBuf::from("file")]));
     }
 
     #[test]
@@ -973,10 +1099,9 @@ mod tests {
         fs::create_dir_all(&root).unwrap();
         fs::write(root.join("file"), b"drift").unwrap();
         let candidates = BTreeMap::from([(PathBuf::from("file"), entry(b"local", false))]);
-        assert_eq!(
-            needed_payloads(&root, &candidates).unwrap(),
-            BTreeSet::from([PathBuf::from("file")])
-        );
+        let diff = full_diff(&root, &candidates).unwrap();
+        assert_eq!(diff.needed, BTreeSet::from([PathBuf::from("file")]));
+        assert_eq!(diff.changed, diff.needed);
     }
 
     #[test]
