@@ -110,7 +110,7 @@ fn transact_plan<R: Read, W: Write>(
     plan: Plan,
 ) -> Result<bool> {
     validate_plan(snapshot, recovery_required, &plan)?;
-    let (needed, changed) = match &plan.kind {
+    let (needed, mut changed) = match &plan.kind {
         PlanKind::Full { entries } => {
             let removals = full_removals(snapshot, recovery_paths, entries);
             let mut diff = full_diff(root, entries)?;
@@ -168,6 +168,10 @@ fn transact_plan<R: Read, W: Write>(
         bail!("expected payload completion message");
     };
 
+    if let PlanKind::Full { entries } = &plan.kind {
+        let promoted = revalidate_skipped_full_paths(root, entries, &changed)?;
+        changed.extend(promoted);
+    }
     let intent = intent_paths(snapshot, recovery_paths, &plan.kind, &changed);
     record_intent(state_path, &intent, recovery_paths)?;
     apply(
@@ -392,6 +396,42 @@ fn full_diff(
         }
     }
     Ok(FullDiff { needed, changed })
+}
+
+fn revalidate_skipped_full_paths(
+    root: &Path,
+    entries: &std::collections::BTreeMap<PathBuf, Entry>,
+    changed: &BTreeSet<PathBuf>,
+) -> Result<BTreeSet<PathBuf>> {
+    let mut promoted = BTreeSet::new();
+    for (path, entry) in entries {
+        if changed.contains(path) {
+            continue;
+        }
+        let actual = if has_safe_real_parents(root, path)? {
+            Entry::from_path(&root.join(path)).ok()
+        } else {
+            None
+        };
+        if actual
+            .as_ref()
+            .is_some_and(|actual| entry.content_matches(actual))
+        {
+            continue;
+        }
+        if entry.needs_payload()
+            && !actual
+                .as_ref()
+                .is_some_and(|actual| entry.payload_matches(actual))
+        {
+            bail!(
+                "remote content changed during full validation: {}",
+                path.display()
+            );
+        }
+        promoted.insert(path.clone());
+    }
+    Ok(promoted)
 }
 
 fn has_safe_real_parents(root: &Path, relative: &Path) -> Result<bool> {
@@ -1090,6 +1130,79 @@ mod tests {
         let diff = full_diff(&root, &candidates).unwrap();
         assert!(diff.needed.is_empty());
         assert_eq!(diff.changed, BTreeSet::from([PathBuf::from("file")]));
+    }
+
+    #[test]
+    fn full_revalidation_rejects_new_content_drift() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("root");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("file"), b"matching").unwrap();
+        let entries = BTreeMap::from([(PathBuf::from("file"), entry(b"matching", false))]);
+        let diff = full_diff(&root, &entries).unwrap();
+        assert!(diff.changed.is_empty());
+
+        fs::write(root.join("file"), b"changed after negotiation").unwrap();
+
+        assert!(revalidate_skipped_full_paths(&root, &entries, &diff.changed).is_err());
+    }
+
+    #[test]
+    fn full_revalidation_promotes_new_mode_drift() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("root");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("file"), b"matching").unwrap();
+        let entries = BTreeMap::from([(PathBuf::from("file"), entry(b"matching", false))]);
+        let diff = full_diff(&root, &entries).unwrap();
+        assert!(diff.changed.is_empty());
+        fs::set_permissions(root.join("file"), fs::Permissions::from_mode(0o755)).unwrap();
+
+        assert_eq!(
+            revalidate_skipped_full_paths(&root, &entries, &diff.changed).unwrap(),
+            BTreeSet::from([PathBuf::from("file")])
+        );
+    }
+
+    #[test]
+    fn full_transaction_skips_unchanged_files_and_repairs_mode_drift() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("root");
+        let state = temp.path().join("state/snapshot.json");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("unchanged"), b"same").unwrap();
+        fs::set_permissions(root.join("unchanged"), fs::Permissions::from_mode(0o600)).unwrap();
+        fs::write(root.join("mode-change"), b"same").unwrap();
+        let entries = BTreeMap::from([
+            (PathBuf::from("unchanged"), entry(b"same", false)),
+            (PathBuf::from("mode-change"), entry(b"same", true)),
+        ]);
+        let plan = Plan {
+            expected_generation: 0,
+            expected_state_id: state_id(&BTreeMap::new()).unwrap(),
+            generation: 1,
+            state_id: state_id(&entries).unwrap(),
+            kind: PlanKind::Full { entries },
+        };
+
+        transact(&root, &state, plan, &[]);
+
+        assert_eq!(
+            fs::metadata(root.join("unchanged"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+        assert_ne!(
+            fs::metadata(root.join("mode-change"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o111,
+            0
+        );
     }
 
     #[test]
