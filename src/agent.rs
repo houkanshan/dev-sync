@@ -170,7 +170,7 @@ fn transact_plan<R: Read, W: Write>(
     };
 
     if let PlanKind::Full { entries } = &plan.kind {
-        let promoted = revalidate_skipped_full_paths(root, entries, &changed, &observed_unchanged)?;
+        let promoted = revalidate_skipped_full_paths(root, entries, &needed, &observed_unchanged)?;
         changed.extend(promoted);
     }
     let intent = intent_paths(snapshot, recovery_paths, &plan.kind, &changed);
@@ -448,12 +448,12 @@ fn full_diff(
 fn revalidate_skipped_full_paths(
     root: &Path,
     entries: &std::collections::BTreeMap<PathBuf, Entry>,
-    changed: &BTreeSet<PathBuf>,
+    payload_backed: &BTreeSet<PathBuf>,
     observed_unchanged: &BTreeMap<PathBuf, MetadataFingerprint>,
 ) -> Result<BTreeSet<PathBuf>> {
     let mut promoted = BTreeSet::new();
     for (path, entry) in entries {
-        if changed.contains(path) {
+        if payload_backed.contains(path) {
             continue;
         }
         let absolute = root.join(path);
@@ -1201,13 +1201,8 @@ mod tests {
         fs::write(root.join("file"), b"changed after negotiation").unwrap();
 
         assert!(
-            revalidate_skipped_full_paths(
-                &root,
-                &entries,
-                &diff.changed,
-                &diff.observed_unchanged,
-            )
-            .is_err()
+            revalidate_skipped_full_paths(&root, &entries, &diff.needed, &diff.observed_unchanged,)
+                .is_err()
         );
     }
 
@@ -1223,14 +1218,29 @@ mod tests {
         fs::set_permissions(root.join("file"), fs::Permissions::from_mode(0o755)).unwrap();
 
         assert_eq!(
-            revalidate_skipped_full_paths(
-                &root,
-                &entries,
-                &diff.changed,
-                &diff.observed_unchanged,
-            )
-            .unwrap(),
+            revalidate_skipped_full_paths(&root, &entries, &diff.needed, &diff.observed_unchanged,)
+                .unwrap(),
             BTreeSet::from([PathBuf::from("file")])
+        );
+    }
+
+    #[test]
+    fn full_revalidation_rejects_content_drift_after_detecting_mode_drift() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("root");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(root.join("file"), b"matching").unwrap();
+        fs::set_permissions(root.join("file"), fs::Permissions::from_mode(0o755)).unwrap();
+        let entries = BTreeMap::from([(PathBuf::from("file"), entry(b"matching", false))]);
+        let diff = full_diff(&root, &entries).unwrap();
+        assert_eq!(diff.changed, BTreeSet::from([PathBuf::from("file")]));
+        assert!(diff.needed.is_empty());
+
+        fs::write(root.join("file"), b"changed after negotiation").unwrap();
+
+        assert!(
+            revalidate_skipped_full_paths(&root, &entries, &diff.needed, &diff.observed_unchanged,)
+                .is_err()
         );
     }
 
