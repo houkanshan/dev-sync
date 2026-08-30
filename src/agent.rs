@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, OpenOptions};
 use std::io::{Read, Seek, Write};
-use std::os::unix::fs::{PermissionsExt, symlink};
+use std::os::unix::fs::{MetadataExt, PermissionsExt, symlink};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
@@ -110,7 +110,7 @@ fn transact_plan<R: Read, W: Write>(
     plan: Plan,
 ) -> Result<bool> {
     validate_plan(snapshot, recovery_required, &plan)?;
-    let (needed, mut changed) = match &plan.kind {
+    let (needed, mut changed, observed_unchanged) = match &plan.kind {
         PlanKind::Full { entries } => {
             let removals = full_removals(snapshot, recovery_paths, entries);
             let mut diff = full_diff(root, entries)?;
@@ -128,7 +128,7 @@ fn transact_plan<R: Read, W: Write>(
                     paths: diff.needed.iter().cloned().collect(),
                 },
             )?;
-            (diff.needed, diff.changed)
+            (diff.needed, diff.changed, diff.observed_unchanged)
         }
         PlanKind::Delta { changes } => (
             changes
@@ -137,6 +137,7 @@ fn transact_plan<R: Read, W: Write>(
                 .map(|(path, _)| path.clone())
                 .collect(),
             changes.keys().cloned().collect(),
+            BTreeMap::new(),
         ),
     };
 
@@ -169,7 +170,7 @@ fn transact_plan<R: Read, W: Write>(
     };
 
     if let PlanKind::Full { entries } = &plan.kind {
-        let promoted = revalidate_skipped_full_paths(root, entries, &changed)?;
+        let promoted = revalidate_skipped_full_paths(root, entries, &changed, &observed_unchanged)?;
         changed.extend(promoted);
     }
     let intent = intent_paths(snapshot, recovery_paths, &plan.kind, &changed);
@@ -347,6 +348,35 @@ fn commit_snapshot(snapshot: &mut Snapshot, plan: &Plan) {
 struct FullDiff {
     needed: BTreeSet<PathBuf>,
     changed: BTreeSet<PathBuf>,
+    observed_unchanged: BTreeMap<PathBuf, MetadataFingerprint>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct MetadataFingerprint {
+    device: u64,
+    inode: u64,
+    mode: u32,
+    size: u64,
+    modified_seconds: i64,
+    modified_nanoseconds: i64,
+    changed_seconds: i64,
+    changed_nanoseconds: i64,
+}
+
+impl MetadataFingerprint {
+    fn from_path(path: &Path) -> Result<Self> {
+        let metadata = fs::symlink_metadata(path)?;
+        Ok(Self {
+            device: metadata.dev(),
+            inode: metadata.ino(),
+            mode: metadata.mode(),
+            size: metadata.size(),
+            modified_seconds: metadata.mtime(),
+            modified_nanoseconds: metadata.mtime_nsec(),
+            changed_seconds: metadata.ctime(),
+            changed_nanoseconds: metadata.ctime_nsec(),
+        })
+    }
 }
 
 fn full_removals(
@@ -378,12 +408,21 @@ fn full_diff(
 ) -> Result<FullDiff> {
     let mut needed = BTreeSet::new();
     let mut changed = BTreeSet::new();
+    let mut observed_unchanged = BTreeMap::new();
     for (path, entry) in entries {
-        let actual = if has_safe_real_parents(root, path)? {
-            Entry::from_path(&root.join(path)).ok()
+        let absolute = root.join(path);
+        let parents_are_safe = has_safe_real_parents(root, path)?;
+        let before = parents_are_safe
+            .then(|| MetadataFingerprint::from_path(&absolute).ok())
+            .flatten();
+        let actual = if parents_are_safe {
+            Entry::from_path(&absolute).ok()
         } else {
             None
         };
+        let after = parents_are_safe
+            .then(|| MetadataFingerprint::from_path(&absolute).ok())
+            .flatten();
         if entry.needs_payload()
             && !actual
                 .as_ref()
@@ -391,25 +430,42 @@ fn full_diff(
         {
             needed.insert(path.clone());
         }
-        if !actual.is_some_and(|actual| entry.content_matches(&actual)) {
+        if actual.is_some_and(|actual| entry.content_matches(&actual)) {
+            if before.is_some() && before == after {
+                observed_unchanged.insert(path.clone(), after.expect("fingerprints match"));
+            }
+        } else {
             changed.insert(path.clone());
         }
     }
-    Ok(FullDiff { needed, changed })
+    Ok(FullDiff {
+        needed,
+        changed,
+        observed_unchanged,
+    })
 }
 
 fn revalidate_skipped_full_paths(
     root: &Path,
     entries: &std::collections::BTreeMap<PathBuf, Entry>,
     changed: &BTreeSet<PathBuf>,
+    observed_unchanged: &BTreeMap<PathBuf, MetadataFingerprint>,
 ) -> Result<BTreeSet<PathBuf>> {
     let mut promoted = BTreeSet::new();
     for (path, entry) in entries {
         if changed.contains(path) {
             continue;
         }
+        let absolute = root.join(path);
+        if has_safe_real_parents(root, path)?
+            && MetadataFingerprint::from_path(&absolute)
+                .ok()
+                .is_some_and(|current| observed_unchanged.get(path) == Some(&current))
+        {
+            continue;
+        }
         let actual = if has_safe_real_parents(root, path)? {
-            Entry::from_path(&root.join(path)).ok()
+            Entry::from_path(&absolute).ok()
         } else {
             None
         };
@@ -1144,7 +1200,15 @@ mod tests {
 
         fs::write(root.join("file"), b"changed after negotiation").unwrap();
 
-        assert!(revalidate_skipped_full_paths(&root, &entries, &diff.changed).is_err());
+        assert!(
+            revalidate_skipped_full_paths(
+                &root,
+                &entries,
+                &diff.changed,
+                &diff.observed_unchanged,
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -1159,7 +1223,13 @@ mod tests {
         fs::set_permissions(root.join("file"), fs::Permissions::from_mode(0o755)).unwrap();
 
         assert_eq!(
-            revalidate_skipped_full_paths(&root, &entries, &diff.changed).unwrap(),
+            revalidate_skipped_full_paths(
+                &root,
+                &entries,
+                &diff.changed,
+                &diff.observed_unchanged,
+            )
+            .unwrap(),
             BTreeSet::from([PathBuf::from("file")])
         );
     }
