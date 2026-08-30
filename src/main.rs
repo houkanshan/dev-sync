@@ -91,9 +91,6 @@ async fn start(project: &Project, foreground: bool) -> Result<()> {
         tokio::time::sleep(Duration::from_millis(25)).await;
         if let Ok(response) = request(project, Request::Status).await {
             print_response(match response {
-                Response::Ok { message } if message.contains("last sync: never") => {
-                    continue;
-                }
                 Response::Ok { .. } => Response::Ok {
                     message: "started".into(),
                 },
