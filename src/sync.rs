@@ -1,7 +1,8 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
+use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 
 use anyhow::{Context, Result, bail};
 
@@ -9,7 +10,7 @@ use devsync::protocol::{Plan, PlanKind};
 use devsync::snapshot::{Entry, Snapshot, delta_state_id, state_id, validate_relative_path};
 use devsync::transport::RemoteState;
 
-pub const RECONCILE_PATHS: [&str; 3] = [".devsyncignore", ".git/info/exclude", ".git/index"];
+pub const RECONCILE_PATHS: [&str; 2] = [".devsyncignore", ".git/info/exclude"];
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PlanMode {
@@ -147,13 +148,33 @@ pub fn dirty_entries(
 
 pub fn needs_reconcile(root: &Path, paths: &BTreeSet<PathBuf>) -> bool {
     paths.iter().any(|path| {
-        path.file_name().is_some_and(|name| name == ".gitignore")
-            || RECONCILE_PATHS
-                .iter()
-                .any(|required| path == Path::new(required))
-            || path == Path::new(".git")
-            || (root.join(path).is_dir() && !root.join(path).is_symlink())
+        is_eligibility_path(path) || (root.join(path).is_dir() && !root.join(path).is_symlink())
     })
+}
+
+/// Drop Watchman noise that cannot change the managed tree: `.git` internals
+/// (except ignore rules) and Git-ignored paths. Eligibility files are kept.
+pub fn retain_relevant_changes(
+    root: &Path,
+    mut paths: BTreeSet<PathBuf>,
+) -> Result<BTreeSet<PathBuf>> {
+    paths.retain(|path| is_eligibility_path(path) || is_literal_candidate(path));
+    let check = paths
+        .iter()
+        .filter(|path| !is_eligibility_path(path))
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    for ignored in git_ignored_paths(root, &check)? {
+        paths.remove(&ignored);
+    }
+    Ok(paths)
+}
+
+fn is_eligibility_path(path: &Path) -> bool {
+    path.file_name().is_some_and(|name| name == ".gitignore")
+        || RECONCILE_PATHS
+            .iter()
+            .any(|required| path == Path::new(required))
 }
 
 fn dirty_is_ambiguous(paths: &BTreeSet<PathBuf>, previous: &BTreeMap<PathBuf, Entry>) -> bool {
@@ -290,6 +311,52 @@ fn custom_ignored_tracked(
         .collect()
 }
 
+fn git_ignored_paths(root: &Path, paths: &BTreeSet<PathBuf>) -> Result<BTreeSet<PathBuf>> {
+    if paths.is_empty() {
+        return Ok(BTreeSet::new());
+    }
+    let mut child = Command::new("git")
+        .current_dir(root)
+        .args(["check-ignore", "-z", "--stdin"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .context("run git check-ignore")?;
+    {
+        let mut stdin = child.stdin.take().context("git check-ignore stdin")?;
+        for path in paths {
+            let Some(text) = path.to_str() else {
+                continue;
+            };
+            stdin.write_all(text.as_bytes())?;
+            stdin.write_all(&[0])?;
+        }
+    }
+    let output = child
+        .wait_with_output()
+        .context("wait for git check-ignore")?;
+    if !output.status.success() {
+        if output.status.code() == Some(1) {
+            return Ok(BTreeSet::new());
+        }
+        bail!(
+            "git check-ignore failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    output
+        .stdout
+        .split(|byte| *byte == 0)
+        .filter(|raw| !raw.is_empty())
+        .map(|raw| {
+            Ok(PathBuf::from(
+                std::str::from_utf8(raw).context("Git returned a non-UTF-8 path")?,
+            ))
+        })
+        .collect()
+}
+
 fn is_literal_candidate(path: &Path) -> bool {
     validate_relative_path(path).is_ok()
         && path != Path::new(".devsync.toml")
@@ -409,5 +476,35 @@ mod tests {
             temp.path(),
             &BTreeSet::from([PathBuf::from("nested/.gitignore")])
         ));
+        assert!(!needs_reconcile(
+            temp.path(),
+            &BTreeSet::from([PathBuf::from(".git/index")])
+        ));
+    }
+
+    #[test]
+    fn retain_relevant_changes_drops_ignored_and_git_noise() {
+        let temp = repo();
+        fs::write(temp.path().join(".gitignore"), b"snapshots/\n").unwrap();
+        fs::create_dir_all(temp.path().join("snapshots/run")).unwrap();
+        fs::write(temp.path().join("snapshots/run/full.txt"), b"x").unwrap();
+        fs::write(temp.path().join("kept.txt"), b"y").unwrap();
+        let kept = retain_relevant_changes(
+            temp.path(),
+            BTreeSet::from([
+                PathBuf::from("snapshots/run"),
+                PathBuf::from("snapshots/run/full.txt"),
+                PathBuf::from(".git/index"),
+                PathBuf::from(".git"),
+                PathBuf::from("kept.txt"),
+                PathBuf::from(".gitignore"),
+                PathBuf::from(".devsync.toml"),
+            ]),
+        )
+        .unwrap();
+        assert_eq!(
+            kept,
+            BTreeSet::from([PathBuf::from("kept.txt"), PathBuf::from(".gitignore")])
+        );
     }
 }

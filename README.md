@@ -25,6 +25,7 @@ devsync stop
 
 The remote needs SSH, a POSIX shell, and `tar`; it does not need `devsync` installed.
 `devsync` probes the remote platform and atomically deploys a matching bundled
-`devsync-agent` into the remote user's cache. Startup and `flush` fully validate
-eligible files but transfer only whole files whose remote content differs; normal
-Watchman batches inspect only dirty literal paths.
+`devsync-agent` into the remote user's cache. Startup, `flush`, Watchman recrawls,
+and ignore-rule changes fully validate eligible files but transfer only whole files
+whose remote content differs. Normal Watchman batches inspect only dirty literal
+paths and skip Git-ignored / `.git` noise.

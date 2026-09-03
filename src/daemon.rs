@@ -175,7 +175,7 @@ async fn watch_once(root: &std::path::Path, work_tx: &mpsc::Sender<Work>) -> Res
         .resolve_root(CanonicalPath::canonicalize(root)?)
         .await?;
     let (mut subscription, _) = client
-        .subscribe::<NameOnly>(&resolved, SubscribeRequest::default())
+        .subscribe::<NameOnly>(&resolved, watchman_subscribe_request())
         .await?;
     loop {
         match subscription.next().await? {
@@ -215,11 +215,15 @@ fn worker_loop(
         while let Ok(work) = work_rx.try_recv() {
             collect_work(work, &mut changed, &mut reconcile, &mut flushes, &mut stop);
         }
+        changed = sync::retain_relevant_changes(&project.root, changed)?;
         if stop.is_some() && changed.is_empty() && !reconcile && flushes.is_empty() {
             if let Some(stop) = stop {
                 let _ = stop.send(Ok(()));
             }
             break;
+        }
+        if !should_sync(force_full, reconcile, !flushes.is_empty(), &changed) {
+            continue;
         }
         let mode = work_mode(
             force_full,
@@ -238,8 +242,14 @@ fn worker_loop(
         } else {
             "delta"
         };
-        if mode == PlanMode::Full {
-            log("sync validate started");
+        if let Some(reason) = validate_reason(
+            force_full,
+            reconcile,
+            !flushes.is_empty(),
+            &project.root,
+            &changed,
+        ) {
+            log(format!("sync validate started ({reason})"));
         }
         let sync_started = Instant::now();
         let result = match sync_once(
@@ -441,6 +451,42 @@ fn sync_once(
     result
 }
 
+fn watchman_subscribe_request() -> SubscribeRequest {
+    SubscribeRequest {
+        empty_on_fresh_instance: true,
+        ..SubscribeRequest::default()
+    }
+}
+
+fn should_sync(
+    force_full: bool,
+    reconcile: bool,
+    flush: bool,
+    changed: &BTreeSet<PathBuf>,
+) -> bool {
+    force_full || reconcile || flush || !changed.is_empty()
+}
+
+fn validate_reason(
+    force_full: bool,
+    reconcile: bool,
+    flush: bool,
+    root: &std::path::Path,
+    changed: &BTreeSet<PathBuf>,
+) -> Option<&'static str> {
+    if force_full {
+        Some("forced")
+    } else if reconcile {
+        Some("watchman recrawl")
+    } else if flush {
+        Some("flush")
+    } else if sync::needs_reconcile(root, changed) {
+        Some("eligibility or directory change")
+    } else {
+        None
+    }
+}
+
 fn work_mode(
     force_full: bool,
     reconcile: bool,
@@ -448,7 +494,7 @@ fn work_mode(
     root: &std::path::Path,
     changed: &BTreeSet<PathBuf>,
 ) -> PlanMode {
-    if force_full || reconcile || flush || sync::needs_reconcile(root, changed) {
+    if validate_reason(force_full, reconcile, flush, root, changed).is_some() {
         PlanMode::Full
     } else {
         PlanMode::Delta
@@ -587,5 +633,22 @@ mod tests {
             work_mode(false, false, false, temp.path(), &changed),
             PlanMode::Delta
         );
+    }
+
+    #[test]
+    fn skips_empty_filtered_batches() {
+        assert!(!should_sync(false, false, false, &BTreeSet::new()));
+        assert!(should_sync(
+            false,
+            false,
+            false,
+            &BTreeSet::from([PathBuf::from("file")])
+        ));
+        assert!(should_sync(false, true, false, &BTreeSet::new()));
+    }
+
+    #[test]
+    fn watchman_subscription_does_not_dump_fresh_trees() {
+        assert!(watchman_subscribe_request().empty_on_fresh_instance);
     }
 }
