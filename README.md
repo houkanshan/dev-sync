@@ -23,6 +23,13 @@ devsync flush
 devsync stop
 ```
 
+Persistent agent sessions receive a heartbeat every 15 seconds between sync batches.
+The agent releases its state lock if a read waits 10 minutes for client input,
+including when a half-open SSH connection never delivers EOF. Local planning and
+payload preparation must not leave the agent waiting longer than this; remote disk
+work is outside the read timeout. A disconnected session is re-established on the
+next sync. This timeout does not bound blocked remote writes or disk operations.
+
 The remote needs SSH, a POSIX shell, and `tar`; it does not need `devsync` installed.
 `devsync` probes the remote platform and atomically deploys a matching bundled
 `devsync-agent` into the remote user's cache. Startup, `flush`, Watchman recrawls,

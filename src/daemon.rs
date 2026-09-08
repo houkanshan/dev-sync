@@ -20,6 +20,7 @@ use crate::sync::{self, PlanMode};
 
 const MAX_LOGGED_PATHS: usize = 20;
 const AGENT_SESSION_TIMEOUT: Duration = Duration::from_secs(60);
+const AGENT_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(15);
 const AGENT_FULL_TRANSACTION_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 
 fn log(message: impl std::fmt::Display) {
@@ -203,9 +204,34 @@ fn worker_loop(
 ) -> Result<()> {
     let runtime = tokio::runtime::Handle::current();
     let mut acknowledged = load_snapshot(&project.snapshot_path)?;
-    let mut session = None;
+    let mut session: Option<AgentSession> = None;
     let mut force_full = true;
-    while let Some(first) = work_rx.blocking_recv() {
+    let mut heartbeat_at = tokio::time::Instant::now() + AGENT_HEARTBEAT_INTERVAL;
+    loop {
+        // Use an absolute deadline: ignored events and no-op plans must not
+        // postpone heartbeats while the remote waits for its next frame.
+        if tokio::time::Instant::now() >= heartbeat_at {
+            if let Some(active) = session.as_mut()
+                && let Err(error) = active.ping()
+            {
+                log(format!(
+                    "agent heartbeat failed; reconnecting on next sync: {error:#}"
+                ));
+                session
+                    .take()
+                    .expect("failed heartbeat session exists")
+                    .abort();
+                force_full = true;
+            }
+            heartbeat_at = tokio::time::Instant::now() + AGENT_HEARTBEAT_INTERVAL;
+        }
+        let first =
+            runtime.block_on(async { tokio::time::timeout_at(heartbeat_at, work_rx.recv()).await });
+        let first = match first {
+            Ok(Some(first)) => first,
+            Ok(None) => break,
+            Err(_) => continue,
+        };
         let mut changed = BTreeSet::new();
         let mut flushes = Vec::new();
         let mut stop = None;
@@ -400,6 +426,15 @@ impl AgentSession {
                 "remote agent transaction timed out after {}s",
                 transaction_timeout.as_secs()
             );
+        }
+        result
+    }
+
+    fn ping(&mut self) -> Result<()> {
+        let timeout = self.agent.terminator().watchdog(AGENT_SESSION_TIMEOUT);
+        let result = transport::ping(&mut self.agent.stdout, &mut self.agent.stdin);
+        if timeout.finish() {
+            bail!("remote agent heartbeat timed out");
         }
         result
     }

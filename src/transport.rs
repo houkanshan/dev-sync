@@ -49,6 +49,15 @@ pub fn connect<R: Read, W: Write>(reader: &mut R, writer: &mut W) -> Result<Remo
     }
 }
 
+pub fn ping<R: Read, W: Write>(reader: &mut R, writer: &mut W) -> Result<()> {
+    write_json(writer, &ClientMessage::Ping)?;
+    match read_json(reader)? {
+        Some(AgentMessage::Pong) => Ok(()),
+        Some(message) => bail!("unexpected agent heartbeat response: {message:?}"),
+        None => bail!("agent closed during heartbeat"),
+    }
+}
+
 pub fn close<W: Write>(writer: &mut W) -> Result<()> {
     write_json(writer, &ClientMessage::Complete)
 }

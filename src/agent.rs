@@ -74,6 +74,7 @@ fn serve_session<R: Read, W: Write>(
 
     loop {
         match read_json(input)? {
+            Some(ClientMessage::Ping) => write_json(output, &AgentMessage::Pong)?,
             Some(ClientMessage::Plan(plan)) => {
                 let reconciled = transact_plan(
                     root,

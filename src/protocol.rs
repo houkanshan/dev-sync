@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 use crate::snapshot::{Entry, Generation};
 
 const MAX_JSON_FRAME: usize = 64 * 1024 * 1024;
-pub const PROTOCOL_VERSION: u32 = 2;
+pub const PROTOCOL_VERSION: u32 = 3;
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "mode", rename_all = "snake_case")]
@@ -48,12 +48,14 @@ pub enum ClientMessage {
     Plan(Plan),
     Payload { path: PathBuf, length: u64 },
     Done,
+    Ping,
     Complete,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum AgentMessage {
+    Pong,
     Hello {
         version: u32,
         generation: Generation,
