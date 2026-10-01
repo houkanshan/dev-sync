@@ -11,6 +11,8 @@ The public CLI is intentionally limited to:
 - `devsync start`
 - `devsync status`
 - `devsync stop`
+- `devsync restart`
+- `devsync tail`
 - `devsync flush`
 
 Do not require `devsync` on the remote. The remote may only be assumed to have SSH, a POSIX shell, and `tar`.
