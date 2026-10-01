@@ -241,23 +241,50 @@ fn worker_loop(
         while let Ok(work) = work_rx.try_recv() {
             collect_work(work, &mut changed, &mut reconcile, &mut flushes, &mut stop);
         }
-        changed = sync::retain_relevant_changes(&project.root, changed)?;
-        if stop.is_some() && changed.is_empty() && !reconcile && flushes.is_empty() {
-            if let Some(stop) = stop {
-                let _ = stop.send(Ok(()));
+        let mut recover_full = false;
+        changed = match sync::retain_relevant_changes(&project.root, changed) {
+            Ok(paths) => paths,
+            Err(error) => {
+                log(format!(
+                    "filter watchman paths failed; validating fully: {error:#}"
+                ));
+                recover_full = true;
+                BTreeSet::new()
             }
-            break;
-        }
-        if !should_sync(force_full, reconcile, !flushes.is_empty(), &changed) {
-            continue;
-        }
-        let mode = work_mode(
-            force_full,
+        };
+        let index_eligibility = match sync::take_index_eligibility_change(
+            &project.root,
+            &acknowledged.entries,
+            &mut changed,
+        ) {
+            Ok(changed_set) => changed_set,
+            Err(error) => {
+                log(format!(
+                    "index eligibility check failed; validating fully: {error:#}"
+                ));
+                true
+            }
+        };
+        let decision = classify_sync(
+            force_full || recover_full,
             reconcile,
             !flushes.is_empty(),
+            index_eligibility,
             &project.root,
             &changed,
         );
+        if matches!(decision, SyncDecision::Skip) {
+            if let Some(stop) = stop {
+                let _ = stop.send(Ok(()));
+                break;
+            }
+            continue;
+        }
+        let (mode, reason) = match decision {
+            SyncDecision::Skip => unreachable!("skip handled above"),
+            SyncDecision::Delta => (PlanMode::Delta, None),
+            SyncDecision::Full(reason) => (PlanMode::Full, Some(reason)),
+        };
         runtime.block_on(async {
             let mut state = state.lock().await;
             state.syncing = true;
@@ -268,13 +295,7 @@ fn worker_loop(
         } else {
             "delta"
         };
-        if let Some(reason) = validate_reason(
-            force_full,
-            reconcile,
-            !flushes.is_empty(),
-            &project.root,
-            &changed,
-        ) {
+        if let Some(reason) = reason {
             log(format!("sync validate started ({reason})"));
         }
         let sync_started = Instant::now();
@@ -493,46 +514,34 @@ fn watchman_subscribe_request() -> SubscribeRequest {
     }
 }
 
-fn should_sync(
-    force_full: bool,
-    reconcile: bool,
-    flush: bool,
-    changed: &BTreeSet<PathBuf>,
-) -> bool {
-    force_full || reconcile || flush || !changed.is_empty()
+#[derive(Debug, PartialEq, Eq)]
+enum SyncDecision {
+    Skip,
+    Delta,
+    Full(&'static str),
 }
 
-fn validate_reason(
+fn classify_sync(
     force_full: bool,
     reconcile: bool,
     flush: bool,
+    index_eligibility: bool,
     root: &std::path::Path,
     changed: &BTreeSet<PathBuf>,
-) -> Option<&'static str> {
-    if force_full {
-        Some("forced")
-    } else if reconcile {
-        Some("watchman recrawl")
-    } else if flush {
-        Some("flush")
-    } else if sync::needs_reconcile(root, changed) {
-        Some("eligibility or directory change")
-    } else {
-        None
+) -> SyncDecision {
+    if !(force_full || reconcile || flush || index_eligibility || !changed.is_empty()) {
+        return SyncDecision::Skip;
     }
-}
-
-fn work_mode(
-    force_full: bool,
-    reconcile: bool,
-    flush: bool,
-    root: &std::path::Path,
-    changed: &BTreeSet<PathBuf>,
-) -> PlanMode {
-    if validate_reason(force_full, reconcile, flush, root, changed).is_some() {
-        PlanMode::Full
+    if force_full {
+        SyncDecision::Full("forced")
+    } else if reconcile {
+        SyncDecision::Full("watchman recrawl")
+    } else if flush {
+        SyncDecision::Full("flush")
+    } else if index_eligibility || sync::needs_reconcile(root, changed) {
+        SyncDecision::Full("eligibility or directory change")
     } else {
-        PlanMode::Delta
+        SyncDecision::Delta
     }
 }
 
@@ -657,29 +666,45 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let changed = BTreeSet::from([PathBuf::from("file")]);
         assert_eq!(
-            work_mode(true, false, false, temp.path(), &changed),
-            PlanMode::Full
+            classify_sync(true, false, false, false, temp.path(), &changed),
+            SyncDecision::Full("forced")
         );
         assert_eq!(
-            work_mode(false, false, true, temp.path(), &changed),
-            PlanMode::Full
+            classify_sync(false, false, true, false, temp.path(), &changed),
+            SyncDecision::Full("flush")
         );
         assert_eq!(
-            work_mode(false, false, false, temp.path(), &changed),
-            PlanMode::Delta
+            classify_sync(false, false, false, false, temp.path(), &changed),
+            SyncDecision::Delta
         );
     }
 
     #[test]
     fn skips_empty_filtered_batches() {
-        assert!(!should_sync(false, false, false, &BTreeSet::new()));
-        assert!(should_sync(
-            false,
-            false,
-            false,
-            &BTreeSet::from([PathBuf::from("file")])
-        ));
-        assert!(should_sync(false, true, false, &BTreeSet::new()));
+        let temp = tempfile::tempdir().unwrap();
+        assert_eq!(
+            classify_sync(false, false, false, false, temp.path(), &BTreeSet::new()),
+            SyncDecision::Skip
+        );
+        assert_eq!(
+            classify_sync(
+                false,
+                false,
+                false,
+                false,
+                temp.path(),
+                &BTreeSet::from([PathBuf::from("file")])
+            ),
+            SyncDecision::Delta
+        );
+        assert_eq!(
+            classify_sync(false, true, false, false, temp.path(), &BTreeSet::new()),
+            SyncDecision::Full("watchman recrawl")
+        );
+        assert_eq!(
+            classify_sync(false, false, false, true, temp.path(), &BTreeSet::new()),
+            SyncDecision::Full("eligibility or directory change")
+        );
     }
 
     #[test]

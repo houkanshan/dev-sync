@@ -48,6 +48,7 @@ next sync. This timeout does not bound blocked remote writes or disk operations.
 The remote needs SSH, a POSIX shell, and `tar`; it does not need `devsync` installed.
 `devsync` probes the remote platform and atomically deploys a matching bundled
 `devsync-agent` into the remote user's cache. Startup, `flush`, Watchman recrawls,
-and ignore-rule changes fully validate eligible files but transfer only whole files
+and eligibility changes fully validate eligible files but transfer only whole files
 whose remote content differs. Normal Watchman batches inspect only dirty literal
-paths and skip Git-ignored / `.git` noise.
+paths and skip Git-ignored / `.git` noise. Index-only events full-validate only when
+`git ls-files` membership changes (`git add -f` / `git rm --cached`).

@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
-use std::io::Write;
+use std::io::{ErrorKind, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
@@ -153,21 +153,40 @@ pub fn needs_reconcile(root: &Path, paths: &BTreeSet<PathBuf>) -> bool {
 }
 
 /// Drop Watchman noise that cannot change the managed tree: `.git` internals
-/// (except ignore rules) and Git-ignored paths. Eligibility files are kept.
+/// (except the index signal and ignore rules) and Git-ignored paths.
 pub fn retain_relevant_changes(
     root: &Path,
     mut paths: BTreeSet<PathBuf>,
 ) -> Result<BTreeSet<PathBuf>> {
-    paths.retain(|path| is_eligibility_path(path) || is_literal_candidate(path));
+    paths.retain(|path| {
+        is_index_path(path) || is_eligibility_path(path) || is_literal_candidate(path)
+    });
     let check = paths
         .iter()
-        .filter(|path| !is_eligibility_path(path))
+        .filter(|path| !is_index_path(path))
         .cloned()
         .collect::<BTreeSet<_>>();
     for ignored in git_ignored_paths(root, &check)? {
         paths.remove(&ignored);
     }
     Ok(paths)
+}
+
+/// Consume a `.git/index` event. Returns whether the managed path set changed.
+pub fn take_index_eligibility_change(
+    root: &Path,
+    previous: &BTreeMap<PathBuf, Entry>,
+    paths: &mut BTreeSet<PathBuf>,
+) -> Result<bool> {
+    if !paths.remove(Path::new(".git/index")) {
+        return Ok(false);
+    }
+    let current = manifest(root)?;
+    Ok(current.len() != previous.len() || current.iter().any(|path| !previous.contains_key(path)))
+}
+
+fn is_index_path(path: &Path) -> bool {
+    path == Path::new(".git/index")
 }
 
 fn is_eligibility_path(path: &Path) -> bool {
@@ -323,19 +342,27 @@ fn git_ignored_paths(root: &Path, paths: &BTreeSet<PathBuf>) -> Result<BTreeSet<
         .stderr(Stdio::piped())
         .spawn()
         .context("run git check-ignore")?;
-    {
-        let mut stdin = child.stdin.take().context("git check-ignore stdin")?;
-        for path in paths {
-            let Some(text) = path.to_str() else {
-                continue;
-            };
-            stdin.write_all(text.as_bytes())?;
-            stdin.write_all(&[0])?;
-        }
+    let mut stdin = child.stdin.take().context("git check-ignore stdin")?;
+    let mut payload = Vec::new();
+    for path in paths {
+        let Some(text) = path.to_str() else {
+            continue;
+        };
+        payload.extend_from_slice(text.as_bytes());
+        payload.push(0);
     }
+    let writer = std::thread::spawn(move || stdin.write_all(&payload));
     let output = child
         .wait_with_output()
         .context("wait for git check-ignore")?;
+    match writer.join() {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) if error.kind() == ErrorKind::BrokenPipe => {}
+        Ok(Err(error)) => {
+            return Err(error).context("write git check-ignore stdin");
+        }
+        Err(_) => bail!("git check-ignore stdin writer panicked"),
+    }
     if !output.status.success() {
         if output.status.code() == Some(1) {
             return Ok(BTreeSet::new());
@@ -504,7 +531,89 @@ mod tests {
         .unwrap();
         assert_eq!(
             kept,
+            BTreeSet::from([
+                PathBuf::from(".git/index"),
+                PathBuf::from("kept.txt"),
+                PathBuf::from(".gitignore"),
+            ])
+        );
+    }
+
+    #[test]
+    fn ignored_nested_gitignore_is_dropped() {
+        let temp = repo();
+        fs::write(temp.path().join(".gitignore"), b"vendor/\n").unwrap();
+        fs::create_dir_all(temp.path().join("vendor/pkg")).unwrap();
+        fs::write(temp.path().join("vendor/pkg/.gitignore"), b"*\n").unwrap();
+        fs::write(temp.path().join("kept.txt"), b"y").unwrap();
+        let kept = retain_relevant_changes(
+            temp.path(),
+            BTreeSet::from([
+                PathBuf::from("vendor/pkg"),
+                PathBuf::from("vendor/pkg/.gitignore"),
+                PathBuf::from("kept.txt"),
+                PathBuf::from(".gitignore"),
+            ]),
+        )
+        .unwrap();
+        assert_eq!(
+            kept,
             BTreeSet::from([PathBuf::from("kept.txt"), PathBuf::from(".gitignore")])
         );
+    }
+
+    #[test]
+    fn check_ignore_handles_large_ignored_batches() {
+        let temp = repo();
+        fs::write(temp.path().join(".gitignore"), b"snapshots/\n").unwrap();
+        let paths = (0..12_000)
+            .map(|index| PathBuf::from(format!("snapshots/{index}")))
+            .collect();
+        assert!(
+            retain_relevant_changes(temp.path(), paths)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn index_only_force_add_and_rm_cached_change_eligibility() {
+        let temp = repo();
+        fs::write(temp.path().join(".gitignore"), b"ignored.txt\n").unwrap();
+        fs::write(temp.path().join("ignored.txt"), b"secret").unwrap();
+        fs::write(temp.path().join("kept.txt"), b"ok").unwrap();
+        let previous = full_entries(temp.path()).unwrap();
+        assert!(!previous.contains_key(Path::new("ignored.txt")));
+
+        git(temp.path(), ["add", "-f", "ignored.txt"]);
+        let mut paths = BTreeSet::from([PathBuf::from(".git/index")]);
+        assert!(take_index_eligibility_change(temp.path(), &previous, &mut paths).unwrap());
+        assert!(paths.is_empty());
+
+        let tracked = full_entries(temp.path()).unwrap();
+        assert!(tracked.contains_key(Path::new("ignored.txt")));
+        git(temp.path(), ["rm", "--cached", "-q", "ignored.txt"]);
+        let mut paths = BTreeSet::from([PathBuf::from(".git/index")]);
+        assert!(take_index_eligibility_change(temp.path(), &tracked, &mut paths).unwrap());
+    }
+
+    #[test]
+    fn index_event_without_eligibility_change_is_consumed() {
+        let temp = repo();
+        fs::write(temp.path().join("kept.txt"), b"ok").unwrap();
+        let previous = full_entries(temp.path()).unwrap();
+        git(temp.path(), ["add", "kept.txt"]);
+        let mut paths = BTreeSet::from([PathBuf::from(".git/index"), PathBuf::from("kept.txt")]);
+        assert!(!take_index_eligibility_change(temp.path(), &previous, &mut paths).unwrap());
+        assert_eq!(paths, BTreeSet::from([PathBuf::from("kept.txt")]));
+    }
+
+    fn git(root: &Path, args: impl IntoIterator<Item = &'static str>) {
+        let status = Command::new("git")
+            .current_dir(root)
+            .args(args)
+            .status()
+            .unwrap();
+        assert!(status.success());
     }
 }
